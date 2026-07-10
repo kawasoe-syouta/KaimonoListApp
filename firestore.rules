@@ -1,0 +1,74 @@
+rules_version = '2';
+
+// 買い物リストアプリ用セキュリティルール
+// 方針: 世帯(household)のメンバーだけがその世帯のデータを読み書きできる
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    // 親の household ドキュメントを読んでメンバー判定(サブコレクション用)
+    function isMember(householdId) {
+      return isSignedIn()
+        && request.auth.uid in get(/databases/$(database)/documents/households/$(householdId)).data.memberIds;
+    }
+
+    // 招待コードで自分だけを memberIds に追加する更新かどうか。
+    // 非メンバーがクライアントから参加できるようにするための限定的な緩和。
+    function isJoiningSelf() {
+      return !(request.auth.uid in resource.data.memberIds)
+        && request.auth.uid in request.resource.data.memberIds
+        && request.resource.data.memberIds.size() == resource.data.memberIds.size() + 1
+        && request.resource.data.memberIds.hasAll(resource.data.memberIds)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['memberIds', 'memberNames']);
+    }
+
+    // 招待コード → 世帯ID の対応表。
+    // ドキュメントIDが招待コードそのものなので get(ID直指定)だけ許可し、
+    // list(列挙)は許可しない = 総当たりでの世帯探索を防ぐ。
+    match /inviteCodes/{code} {
+      allow get:    if isSignedIn();
+      allow create: if isSignedIn();
+      allow update, delete: if false;
+    }
+
+    match /households/{householdId} {
+      // 作成: サインイン済み かつ 自分自身をメンバーに含めている場合のみ
+      allow create: if isSignedIn()
+        && request.auth.uid in request.resource.data.memberIds;
+
+      // 読み取り: メンバーのみ(自ドキュメントなので resource で直接判定)
+      allow read: if isSignedIn()
+        && request.auth.uid in resource.data.memberIds;
+
+      // 更新: 既存メンバー(退出=自分の削除を含む)、または招待コードでの自己参加のみ
+      allow update: if isSignedIn()
+        && (request.auth.uid in resource.data.memberIds || isJoiningSelf());
+
+      // 世帯の削除はアプリからは不可(誤操作・悪意による全消し防止)
+      allow delete: if false;
+
+      // 買い物アイテム
+      match /items/{itemId} {
+        allow read, write: if isMember(householdId);
+      }
+
+      // カテゴリ(世帯単位で共有されるカスタムカテゴリ)
+      match /categories/{categoryId} {
+        allow read, write: if isMember(householdId);
+      }
+
+      // レシピ帳(献立プランナー)
+      match /recipes/{recipeId} {
+        allow read, write: if isMember(householdId);
+      }
+
+      // 献立(日付ごとのレシピ割り当て)
+      match /mealPlans/{entryId} {
+        allow read, write: if isMember(householdId);
+      }
+    }
+  }
+}
