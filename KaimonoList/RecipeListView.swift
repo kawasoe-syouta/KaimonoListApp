@@ -51,14 +51,15 @@ struct RecipeListView: View {
             }
         }
         .sheet(isPresented: $isShowingAddSheet) {
-            RecipeEditSheet(title: "レシピを追加", recipe: nil) { name, emoji, ingredients, memo in
-                viewModel.addRecipe(name: name, emoji: emoji, ingredients: ingredients, memo: memo)
+            RecipeEditSheet(title: "レシピを追加", recipe: nil) { name, emoji, ingredients, memo, baseServings in
+                viewModel.addRecipe(name: name, emoji: emoji, ingredients: ingredients,
+                                    memo: memo, baseServings: baseServings)
             }
         }
         .sheet(item: $editingRecipe) { recipe in
-            RecipeEditSheet(title: "レシピを編集", recipe: recipe) { name, emoji, ingredients, memo in
+            RecipeEditSheet(title: "レシピを編集", recipe: recipe) { name, emoji, ingredients, memo, baseServings in
                 viewModel.updateRecipe(recipe, name: name, emoji: emoji,
-                                       ingredients: ingredients, memo: memo)
+                                       ingredients: ingredients, memo: memo, baseServings: baseServings)
             }
         }
     }
@@ -93,17 +94,19 @@ private struct RecipeRow: View {
 struct RecipeEditSheet: View {
     let title: String
     let onSave: (_ name: String, _ emoji: String,
-                 _ ingredients: [RecipeIngredient], _ memo: String) -> Void
+                 _ ingredients: [RecipeIngredient], _ memo: String, _ baseServings: Int) -> Void
 
     @Environment(\.dismiss) private var dismiss
     @State private var name: String
     @State private var emoji: String
     @State private var ingredients: [RecipeIngredient]
     @State private var memo: String
+    /// この材料数量が何人前の分量か。献立の人数と比べて数量をスケールする基準になる
+    @State private var baseServings: Int
 
     init(title: String, recipe: Recipe?,
          onSave: @escaping (_ name: String, _ emoji: String,
-                            _ ingredients: [RecipeIngredient], _ memo: String) -> Void) {
+                            _ ingredients: [RecipeIngredient], _ memo: String, _ baseServings: Int) -> Void) {
         self.title = title
         self.onSave = onSave
         _name = State(initialValue: recipe?.name ?? "")
@@ -111,6 +114,7 @@ struct RecipeEditSheet: View {
         // 新規作成時は空の材料行を1つ用意しておく(すぐ入力を始められるように)
         _ingredients = State(initialValue: recipe?.ingredients ?? [RecipeIngredient(name: "")])
         _memo = State(initialValue: recipe?.memo ?? "")
+        _baseServings = State(initialValue: recipe?.baseServingsOrDefault ?? MealPlanEntry.defaultServings)
     }
 
     private static let presetEmojis = [
@@ -143,6 +147,19 @@ struct RecipeEditSheet: View {
                             .buttonStyle(.plain)
                         }
                     }
+                }
+
+                Section {
+                    Stepper(value: $baseServings, in: MealPlannerViewModel.servingsRange) {
+                        HStack {
+                            Text("何人前の分量")
+                            Spacer()
+                            Text("\(baseServings)人前")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                } footer: {
+                    Text("ここで入力する数量が何人前かの基準です。献立でこれと違う人数を選ぶと、買い物リストの数量が比率で自動調整されます。")
                 }
 
                 Section {
@@ -185,7 +202,7 @@ struct RecipeEditSheet: View {
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("保存") {
-                        onSave(name, emoji, ingredients, memo)
+                        onSave(name, emoji, ingredients, memo, baseServings)
                         dismiss()
                     }
                     .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)

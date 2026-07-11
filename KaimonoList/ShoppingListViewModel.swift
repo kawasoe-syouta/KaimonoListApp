@@ -173,6 +173,27 @@ final class ShoppingListViewModel {
         itemsRef.document(id).delete()
     }
 
+    /// アイテムのカテゴリを変更する。nil を渡すと「未分類」へ戻す。
+    func updateItemCategory(_ item: ShoppingItem, categoryId: String?) {
+        guard let id = item.id else { return }
+        if let categoryId {
+            itemsRef.document(id).updateData(["categoryId": categoryId])
+        } else {
+            itemsRef.document(id).updateData(["categoryId": FieldValue.delete()])
+        }
+    }
+
+    /// 未購入をまとめて削除(買わないと決めたものの一括クリア用)。
+    /// 購入していないので purchaseHistory には記録しない。購入済みは残す。
+    func clearUnchecked() {
+        let batch = db.batch()
+        for item in items where !item.isChecked {
+            guard let id = item.id else { continue }
+            batch.deleteDocument(itemsRef.document(id))
+        }
+        batch.commit()
+    }
+
     /// 購入済みをまとめて削除(レジ後のリセット用)。
     /// 削除の前に purchaseHistory へ記録し、献立提案(MealSuggester)の学習データにする。
     func clearChecked() {

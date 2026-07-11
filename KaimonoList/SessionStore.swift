@@ -84,6 +84,14 @@ final class SessionStore {
         try await seedDefaultCategoriesIfNeeded(householdId: householdId)
         try await ensureInviteCodeMapping(householdId: householdId)
         state = .ready(uid: uid, householdId: householdId)
+        registerForPush(uid: uid, householdId: householdId)
+    }
+
+    /// 共有メンバーからの追加通知を受け取れるよう、通知許可を求めて
+    /// デバイストークンをこの世帯に登録する。世帯が確定するたびに呼ぶ。
+    private func registerForPush(uid: String, householdId: String) {
+        PushManager.shared.updateContext(householdId: householdId, uid: uid)
+        PushManager.shared.requestAuthorizationAndRegister()
     }
 
     // MARK: - Sign in with Apple
@@ -147,6 +155,7 @@ final class SessionStore {
     /// 端末に保存したアクティブ世帯IDは残す(同じアカウントなら次回そのまま復帰でき、
     /// 別アカウントがサインインした場合は ensureHousehold 側でメンバー判定して弾く)。
     func signOut() {
+        Task { await PushManager.shared.clearRegistration() }
         do {
             try Auth.auth().signOut()
             state = .signedOut
@@ -268,6 +277,7 @@ final class SessionStore {
         // 3. アクティブな世帯を切り替える
         UserDefaults.standard.set(householdId, forKey: householdIdKey)
         state = .ready(uid: uid, householdId: householdId)
+        registerForPush(uid: uid, householdId: householdId)
     }
 
     /// 現在の世帯から退出する。自分を memberIds / memberNames から外し、
@@ -276,6 +286,10 @@ final class SessionStore {
         guard let uid = currentUid, let householdId = currentHouseholdId else {
             throw JoinError.notSignedIn
         }
+
+        // memberIds から外れると deviceTokens への書き込みがルールで拒否されるため、
+        // 退出処理より先にこの世帯のトークン登録を消しておく。
+        await PushManager.shared.clearRegistration()
 
         try await db.collection("households").document(householdId).updateData([
             "memberIds": FieldValue.arrayRemove([uid]),

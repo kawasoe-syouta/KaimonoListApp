@@ -8,6 +8,9 @@ import SwiftUI
 struct RootTabView: View {
     let session: SessionStore
 
+    /// 初回起動時のチュートリアルを表示済みか。true になると次回以降は出さない。
+    @AppStorage("hasCompletedOnboarding") private var hasCompletedOnboarding = false
+
     var body: some View {
         if case let .ready(uid, householdId) = session.state {
             TabView {
@@ -30,6 +33,12 @@ struct RootTabView: View {
             }
             // householdId が変わったらリスト・献立タブの ViewModel を作り直す
             .id(householdId)
+            // 初回のみチュートリアルを全画面で表示する
+            .fullScreenCover(isPresented: .constant(!hasCompletedOnboarding)) {
+                OnboardingView {
+                    hasCompletedOnboarding = true
+                }
+            }
         }
     }
 }

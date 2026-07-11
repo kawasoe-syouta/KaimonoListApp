@@ -38,6 +38,16 @@ final class MealPlannerViewModel {
         planEntries.filter { $0.ingredientsAddedAt == nil }.count
     }
 
+    /// 表示中(今日以降)の献立が1件でもあるか(まとめて削除ボタンの活性判定)
+    var hasPlanEntries: Bool {
+        !planEntries.isEmpty
+    }
+
+    /// 材料をすでに買い物リストへ展開した献立があるか(まとめて削除の選択肢切り替えに使用)
+    var hasAddedIngredients: Bool {
+        planEntries.contains { $0.ingredientsAddedAt != nil }
+    }
+
     // MARK: - 依存
 
     let householdId: String
@@ -140,7 +150,8 @@ final class MealPlannerViewModel {
 
     // MARK: - レシピ操作
 
-    func addRecipe(name: String, emoji: String, ingredients: [RecipeIngredient], memo: String) {
+    func addRecipe(name: String, emoji: String, ingredients: [RecipeIngredient],
+                   memo: String, baseServings: Int) {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
@@ -150,6 +161,7 @@ final class MealPlannerViewModel {
             emoji: emoji.isEmpty ? "🍽️" : emoji,
             ingredients: cleanedIngredients(ingredients),
             memo: cleanedMemo(memo),
+            baseServings: Self.clampedServings(baseServings),
             createdAt: nil   // サーバー時刻
         )
         do {
@@ -160,7 +172,7 @@ final class MealPlannerViewModel {
     }
 
     func updateRecipe(_ recipe: Recipe, name: String, emoji: String,
-                      ingredients: [RecipeIngredient], memo: String) {
+                      ingredients: [RecipeIngredient], memo: String, baseServings: Int) {
         guard let id = recipe.id else { return }
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
@@ -170,6 +182,7 @@ final class MealPlannerViewModel {
         updated.emoji = emoji.isEmpty ? "🍽️" : emoji
         updated.ingredients = cleanedIngredients(ingredients)
         updated.memo = cleanedMemo(memo)
+        updated.baseServings = Self.clampedServings(baseServings)
         do {
             try recipesRef.document(id).setData(from: updated)
         } catch {
@@ -205,7 +218,7 @@ final class MealPlannerViewModel {
 
     // MARK: - 献立操作
 
-    func addPlan(recipe: Recipe, on date: Date) {
+    func addPlan(recipe: Recipe, on date: Date, servings: Int) {
         guard let recipeId = recipe.id else { return }
         let entry = MealPlanEntry(
             id: nil,
@@ -214,6 +227,7 @@ final class MealPlannerViewModel {
             recipeName: recipe.name,
             recipeEmoji: recipe.emoji,
             addedByUid: currentUid,
+            servings: Self.clampedServings(servings),
             createdAt: nil,   // サーバー時刻
             ingredientsAddedAt: nil
         )
@@ -224,20 +238,205 @@ final class MealPlannerViewModel {
         }
     }
 
-    func removePlan(_ entry: MealPlanEntry) {
+    /// レシピ選択シートで1件選ばれたときの入口。
+    /// カタログ由来(まだ Firestore に無い)なら先にレシピ帳へ保存してから献立に追加し、
+    /// レシピ帳のレシピならそのまま献立に追加する。
+    func selectRecipe(_ recipe: Recipe, on date: Date, servings: Int) {
+        if RecipeCatalog.isCatalog(recipe) {
+            addPlanFromCatalog(recipe, on: date, servings: servings)
+        } else {
+            addPlan(recipe: recipe, on: date, servings: servings)
+        }
+    }
+
+    /// カタログの定番レシピを献立へ追加する。
+    /// 同名のレシピがすでにレシピ帳にあれば再利用し、無ければレシピ帳へ保存(マテリアライズ)して
+    /// 採番された Firestore ドキュメントIDで献立エントリを作る。
+    private func addPlanFromCatalog(_ catalogRecipe: Recipe, on date: Date, servings: Int) {
+        let key = MealSuggester.normalize(catalogRecipe.name)
+        if let existing = recipes.first(where: { MealSuggester.normalize($0.name) == key }) {
+            addPlan(recipe: existing, on: date, servings: servings)
+            return
+        }
+
+        // id / createdAt はサーバー採番に任せるため、合成値を外した新規レシピを保存する
+        let recipe = Recipe(
+            id: nil,
+            name: catalogRecipe.name,
+            emoji: catalogRecipe.emoji,
+            ingredients: catalogRecipe.ingredients,
+            memo: catalogRecipe.memo,
+            createdAt: nil
+        )
+        do {
+            let ref = try recipesRef.addDocument(from: recipe)
+            var saved = recipe
+            saved.id = ref.documentID
+            addPlan(recipe: saved, on: date, servings: servings)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    /// 追加済みの献立の人数を更新する。
+    /// すでに材料を買い物リストへ展開済み(ingredientsAddedAt != nil)なら、
+    /// その献立由来の未購入アイテムの数量も新しい人数に合わせて再計算する。
+    /// (購入済みアイテムはそのまま残す)
+    func updateServings(_ entry: MealPlanEntry, to servings: Int) async {
         guard let id = entry.id else { return }
-        plansRef.document(id).delete()
+        let clamped = Self.clampedServings(servings)
+        guard clamped != entry.servingsOrDefault else { return }
+
+        do {
+            // 材料未展開、またはレシピが削除済みなら人数だけ更新する
+            guard entry.ingredientsAddedAt != nil,
+                  let recipe = recipes.first(where: { $0.id == entry.recipeId }) else {
+                try await plansRef.document(id).updateData(["servings": clamped])
+                return
+            }
+
+            // 材料名 → 新しい人数にスケールした数量(nil = 数量欄を消す)
+            let scaledByName: [String: String?] = Dictionary(
+                recipe.ingredients.map { ingredient in
+                    (ingredient.name,
+                     IngredientScaler.scale(ingredient.quantity,
+                                            from: recipe.baseServingsOrDefault, to: clamped))
+                },
+                uniquingKeysWith: { first, _ in first }
+            )
+
+            // このレシピ由来の未購入アイテムだけを対象に数量を更新する
+            let snapshot = try await itemsRef
+                .whereField("isChecked", isEqualTo: false)
+                .whereField("sourceRecipeName", isEqualTo: recipe.name)
+                .getDocuments()
+
+            let batch = db.batch()
+            batch.updateData(["servings": clamped], forDocument: plansRef.document(id))
+            for document in snapshot.documents {
+                guard let name = document.data()["name"] as? String,
+                      let scaled = scaledByName[name] else { continue }
+                if let scaled {
+                    batch.updateData(["quantity": scaled], forDocument: document.reference)
+                } else {
+                    batch.updateData(["quantity": FieldValue.delete()], forDocument: document.reference)
+                }
+            }
+            try await batch.commit()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    /// 人数の選択範囲(1〜12人前)。範囲外の入力をこの範囲に収める
+    static let servingsRange = 1...12
+    static func clampedServings(_ servings: Int) -> Int {
+        min(max(servings, servingsRange.lowerBound), servingsRange.upperBound)
+    }
+
+    /// レシピ帳にまだ無い「定番レシピ」。レシピ選択シートの「いろいろな料理」欄と
+    /// 提案生成の候補に使う。すでに同名レシピを登録済みのものは重複を避けて除外する。
+    var catalogCandidates: [Recipe] {
+        let registered = Set(recipes.map { MealSuggester.normalize($0.name) })
+        return RecipeCatalog.all.filter { !registered.contains(MealSuggester.normalize($0.name)) }
+    }
+
+    /// 献立を削除する。
+    /// - Parameter alsoRemovingIngredients: true のとき、そのレシピの材料のうち
+    ///   「未購入」かつ「削除後に残る他の献立では使わない」ものを買い物リストからも削除する。
+    ///   購入済み(チェック済み)の材料は残す。
+    func removePlan(_ entry: MealPlanEntry, alsoRemovingIngredients: Bool) async {
+        guard let entryId = entry.id else { return }
+
+        // 材料を消さない、またはレシピが見つからない(削除済み)場合は献立エントリのみ削除
+        guard alsoRemovingIngredients,
+              let recipe = recipes.first(where: { $0.id == entry.recipeId }) else {
+            try? await plansRef.document(entryId).delete()
+            return
+        }
+
+        // 他の残る献立で使う材料は残すため、削除対象から除外する
+        let recipesById = Dictionary(recipes.compactMap { recipe in
+            recipe.id.map { ($0, recipe) }
+        }, uniquingKeysWith: { first, _ in first })
+        let namesToRemove = MealPlanIngredientRemoval.namesToRemove(
+            deletedRecipe: recipe,
+            remainingEntries: planEntries.filter { $0.id != entry.id },
+            recipesById: recipesById
+        )
+        guard !namesToRemove.isEmpty else {
+            try? await plansRef.document(entryId).delete()
+            return
+        }
+
+        do {
+            // 未購入アイテムのみを対象に、品名が一致するものを削除
+            let snapshot = try await itemsRef
+                .whereField("isChecked", isEqualTo: false)
+                .getDocuments()
+            let batch = db.batch()
+            batch.deleteDocument(plansRef.document(entryId))
+            for document in snapshot.documents {
+                guard let name = document.data()["name"] as? String,
+                      namesToRemove.contains(name) else { continue }
+                batch.deleteDocument(document.reference)
+            }
+            try await batch.commit()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    /// 表示中(今日以降)の献立をすべて削除する。買い物リストの「まとめて削除」に相当。
+    /// - Parameter alsoRemovingIngredients: true のとき、削除する献立の材料のうち
+    ///   「未購入」のものを買い物リストからも削除する。購入済み(チェック済み)は残す。
+    func removeAllPlans(alsoRemovingIngredients: Bool) async {
+        let entries = planEntries
+        guard !entries.isEmpty else { return }
+
+        // 全献立を消すので「残る献立で使う材料」は無い → 各レシピの全材料が削除候補になる。
+        // 材料を消さない場合は空集合のまま(献立エントリの削除だけ行う)。
+        var namesToRemove: Set<String> = []
+        if alsoRemovingIngredients {
+            for entry in entries {
+                guard let recipe = recipes.first(where: { $0.id == entry.recipeId }) else { continue }
+                namesToRemove.formUnion(recipe.ingredients.map(\.name))
+            }
+        }
+
+        do {
+            let batch = db.batch()
+            for entry in entries {
+                guard let id = entry.id else { continue }
+                batch.deleteDocument(plansRef.document(id))
+            }
+            if !namesToRemove.isEmpty {
+                // 未購入アイテムのみを対象に、品名が一致するものを削除
+                let snapshot = try await itemsRef
+                    .whereField("isChecked", isEqualTo: false)
+                    .getDocuments()
+                for document in snapshot.documents {
+                    guard let name = document.data()["name"] as? String,
+                          namesToRemove.contains(name) else { continue }
+                    batch.deleteDocument(document.reference)
+                }
+            }
+            try await batch.commit()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
     }
 
     // MARK: - 献立提案(購入履歴からの好みスコアリング)
 
-    /// 直近の購入履歴を集計し、好みに合うレシピを `suggestions` に反映する。
-    /// レシピ選択シートを開いたときに呼ぶ。今週すでに予定に入っているレシピは除外する。
+    /// 購入履歴(好み)・当月の旬食材・直近の献立履歴(マンネリ回避)を総合して、
+    /// おすすめレシピを `suggestions` に反映する。レシピ選択シートを開いたときに呼ぶ。
+    /// 今週すでに予定に入っているレシピは除外する。
     func generateSuggestions() async {
         isGeneratingSuggestions = true
         defer { isGeneratingSuggestions = false }
         do {
-            // 直近500件のみ集計(複合インデックス不要な単一フィールド order)
+            // 好み: 直近500件のみ集計(複合インデックス不要な単一フィールド order)
             let snapshot = try await purchaseHistoryRef
                 .order(by: "purchasedAt", descending: true)
                 .limit(to: 500)
@@ -251,10 +450,15 @@ final class MealPlannerViewModel {
                 preferenceCounts[key, default: 0] += 1
             }
 
+            // マンネリ回避: 直近30日に作った(献立へ入れた)レシピほど提案を控える
+            let recentCooks = try await recentCookCounts(days: 30)
+
             let excluded = Set(planEntries.map(\.recipeId))
             suggestions = MealSuggester.suggest(
-                recipes: recipes,
+                recipes: recipes + catalogCandidates,
                 preferenceCounts: preferenceCounts,
+                seasonalIngredients: SeasonalIngredients.current(),
+                recentCookCounts: recentCooks,
                 excludedRecipeIds: excluded,
                 limit: 5
             )
@@ -264,7 +468,35 @@ final class MealPlannerViewModel {
         }
     }
 
+    /// 直近 `days` 日の過去の献立を集計し、recipeId → 作った回数 を返す。
+    /// `date` の範囲クエリのみ(単一フィールド)なので複合インデックスは不要。
+    private func recentCookCounts(days: Int) async throws -> [String: Int] {
+        let today = Calendar.current.startOfDay(for: Date())
+        guard let cutoff = Calendar.current.date(byAdding: .day, value: -days, to: today) else {
+            return [:]
+        }
+        let snapshot = try await plansRef
+            .whereField("date", isGreaterThanOrEqualTo: Self.dateKey(cutoff))
+            .whereField("date", isLessThan: Self.dateKey(today))
+            .getDocuments()
+
+        var counts: [String: Int] = [:]
+        for document in snapshot.documents {
+            guard let recipeId = document.data()["recipeId"] as? String else { continue }
+            counts[recipeId, default: 0] += 1
+        }
+        return counts
+    }
+
     // MARK: - 食材展開(レシピ → 買い物リスト)
+
+    /// 買い物リストへ追加する材料1件と、その出所(献立レシピ)。
+    /// 買い物リスト側で「どの料理の材料か」を表示するために出所を持たせる。
+    private struct IngredientToAdd {
+        let ingredient: RecipeIngredient
+        let recipeName: String
+        let recipeEmoji: String
+    }
 
     /// 1件の献立の材料を買い物リストへ追加する
     func addIngredients(for entry: MealPlanEntry) async {
@@ -273,7 +505,7 @@ final class MealPlannerViewModel {
             return
         }
         do {
-            let addedCount = try await addToShoppingList(recipe.ingredients)
+            let addedCount = try await addToShoppingList(additions(from: recipe, servings: entry.servingsOrDefault))
             markIngredientsAdded([entry])
             infoMessage = addedCount == 0
                 ? "材料はすべてリストにあります"
@@ -288,12 +520,12 @@ final class MealPlannerViewModel {
         let pending = planEntries.filter { $0.ingredientsAddedAt == nil }
         guard !pending.isEmpty else { return }
 
-        var ingredients: [RecipeIngredient] = []
+        var ingredients: [IngredientToAdd] = []
         var resolvedEntries: [MealPlanEntry] = []
         for entry in pending {
             // レシピが削除された献立はスキップ(未展開のまま残す)
             guard let recipe = recipes.first(where: { $0.id == entry.recipeId }) else { continue }
-            ingredients += recipe.ingredients
+            ingredients += additions(from: recipe, servings: entry.servingsOrDefault)
             resolvedEntries.append(entry)
         }
         guard !resolvedEntries.isEmpty else {
@@ -312,10 +544,23 @@ final class MealPlannerViewModel {
         }
     }
 
+    /// レシピの各材料に出所(料理名・絵文字)を添えて追加候補にする。
+    /// 数量は「献立の人数 / レシピの基準人数」でスケールする。
+    private func additions(from recipe: Recipe, servings: Int) -> [IngredientToAdd] {
+        recipe.ingredients.map { ingredient in
+            var scaled = ingredient
+            scaled.quantity = IngredientScaler.scale(
+                ingredient.quantity, from: recipe.baseServingsOrDefault, to: servings
+            )
+            return IngredientToAdd(ingredient: scaled, recipeName: recipe.name, recipeEmoji: recipe.emoji)
+        }
+    }
+
     /// 材料を買い物アイテムとして一括追加し、追加した件数を返す。
     /// - 同じ品名が未購入リストに既にある場合はスキップ(数量の合算はしない)
     /// - カテゴリは CategoryGuesser で推定。推定できなければ未分類のまま追加
-    private func addToShoppingList(_ ingredients: [RecipeIngredient]) async throws -> Int {
+    /// - どの料理から追加したかを sourceRecipeName / sourceRecipeEmoji に記録する
+    private func addToShoppingList(_ additions: [IngredientToAdd]) async throws -> Int {
         let snapshot = try await itemsRef
             .whereField("isChecked", isEqualTo: false)
             .getDocuments()
@@ -323,7 +568,8 @@ final class MealPlannerViewModel {
 
         let batch = db.batch()
         var addedCount = 0
-        for ingredient in ingredients {
+        for addition in additions {
+            let ingredient = addition.ingredient
             guard !existingNames.contains(ingredient.name) else { continue }
             existingNames.insert(ingredient.name)   // 同一レシピ・レシピ間の重複も防ぐ
 
@@ -332,6 +578,8 @@ final class MealPlannerViewModel {
                 "isChecked": false,
                 "addedByUid": currentUid,
                 "addedByName": currentUserName,
+                "sourceRecipeName": addition.recipeName,
+                "sourceRecipeEmoji": addition.recipeEmoji,
                 "createdAt": FieldValue.serverTimestamp(),
             ]
             if let categoryId = categoryId(forMatcherKey: CategoryGuesser.guessKey(from: ingredient.name)) {

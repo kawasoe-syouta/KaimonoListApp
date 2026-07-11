@@ -1,4 +1,5 @@
 import Testing
+import Foundation
 @testable import KaimonoList
 
 /// MealSuggester の献立提案スコアリングの検証。
@@ -131,5 +132,110 @@ struct MealSuggesterTests {
         )
 
         #expect(result.isEmpty)
+    }
+
+    // MARK: - 旬の食材
+
+    @Test("旬の食材を含むレシピは加点され、理由に記録される")
+    func addsSeasonalBonus() {
+        let recipes = [recipe(id: "a", name: "焼きなす", ingredients: ["なす", "醤油"])]
+
+        let result = MealSuggester.suggest(
+            recipes: recipes,
+            preferenceCounts: ["醤油": 1],
+            seasonalIngredients: ["なす"],
+            excludedRecipeIds: [],
+            limit: 5
+        )
+
+        // 好み1 + 旬ボーナス(なす1つ)
+        #expect(result.first?.score == 1 + MealSuggester.seasonalBonusPerIngredient)
+        #expect(result.first?.seasonalMatches == ["なす"])
+    }
+
+    @Test("好み履歴が無くても旬の食材だけで提案できる")
+    func seasonalOnlySuggestion() {
+        let recipes = [recipe(id: "a", name: "冷やしトマト", ingredients: ["トマト"])]
+
+        let result = MealSuggester.suggest(
+            recipes: recipes,
+            preferenceCounts: [:],
+            seasonalIngredients: ["トマト"],
+            excludedRecipeIds: [],
+            limit: 5
+        )
+
+        #expect(result.map(\.id) == ["a"])
+        #expect(result.first?.score == MealSuggester.seasonalBonusPerIngredient)
+    }
+
+    // MARK: - マンネリ回避(直近の献立履歴)
+
+    @Test("直近に作ったレシピは減点され、作っていないレシピが上位に来る")
+    func penalizesRecentlyCooked() {
+        let recipes = [
+            recipe(id: "a", name: "カレー", ingredients: ["じゃがいも", "牛肉"]),
+            recipe(id: "b", name: "肉じゃが", ingredients: ["じゃがいも", "牛肉"]),
+        ]
+        let counts = ["じゃがいも": 5, "牛肉": 5]   // どちらも好みスコアは 10 で同点
+
+        let result = MealSuggester.suggest(
+            recipes: recipes,
+            preferenceCounts: counts,
+            recentCookCounts: ["a": 2],   // カレーは直近2回作った
+            excludedRecipeIds: [],
+            limit: 5
+        )
+
+        // 減点で肉じゃがが上位に
+        #expect(result.map(\.id) == ["b", "a"])
+        #expect(result.first?.score == 10)
+        #expect(result.last?.score == 10 - 2 * MealSuggester.recencyPenaltyPerCook)
+    }
+
+    @Test("減点でスコアが0以下になったレシピは提案しない")
+    func dropsRecipeWhenPenaltyExceedsScore() {
+        let recipes = [recipe(id: "a", name: "味噌汁", ingredients: ["豆腐"])]
+        let counts = ["豆腐": 1]
+
+        let result = MealSuggester.suggest(
+            recipes: recipes,
+            preferenceCounts: counts,
+            recentCookCounts: ["a": 3],   // 1 - 3*4 = -11
+            excludedRecipeIds: [],
+            limit: 5
+        )
+
+        #expect(result.isEmpty)
+    }
+}
+
+// MARK: - 旬の食材テーブル
+
+struct SeasonalIngredientsTests {
+
+    @Test("指定した月の旬食材を返す")
+    func returnsIngredientsForMonth() {
+        #expect(SeasonalIngredients.forMonth(7).contains("なす"))
+        #expect(SeasonalIngredients.forMonth(1).contains("大根"))
+    }
+
+    @Test("範囲外の月は空を返す")
+    func returnsEmptyForInvalidMonth() {
+        #expect(SeasonalIngredients.forMonth(0).isEmpty)
+        #expect(SeasonalIngredients.forMonth(13).isEmpty)
+    }
+
+    @Test("current は指定日の月の旬食材を正規化して返す")
+    func currentNormalizesForGivenDate() {
+        var components = DateComponents()
+        components.year = 2026
+        components.month = 7
+        components.day = 15
+        let calendar = Calendar(identifier: .gregorian)
+        let july = calendar.date(from: components)!
+
+        let result = SeasonalIngredients.current(now: july, calendar: calendar)
+        #expect(result.contains("なす"))
     }
 }

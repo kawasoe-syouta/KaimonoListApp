@@ -1,17 +1,29 @@
 import SwiftUI
 import FirebaseCore
 
+/// アプリ実行環境の判定をまとめる。
+enum AppEnvironment {
+    /// XCTest / Swift Testing のホスト実行中かどうか。テスト時は
+    /// 環境変数 XCTestConfigurationFilePath がテストランナーによって設定される。
+    static var isRunningUnitTests: Bool {
+        ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+    }
+}
+
 @main
 struct KaimonoListApp: App {
     /// 認証・世帯の状態を保持する。Firebase 設定後に生成する必要があるため
     /// プロパティ初期化子ではなく init 内で組み立てる(下記の順序に注意)。
     @State private var session: SessionStore
 
+    /// APNs デバイストークンの受け渡しに必要な UIApplicationDelegate を接続する。
+    @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+
     init() {
         // ユニットテストはホストアプリ上で実行されるためこの init が走る。
         // テスト時は GoogleService-Info.plist を前提とする Firebase を構成せず、
         // Firestore にも触れない(ロジックのテストに Firebase は不要)。
-        if !Self.isRunningUnitTests {
+        if !AppEnvironment.isRunningUnitTests {
             FirebaseApp.configure()
         }
         _session = State(initialValue: SessionStore())
@@ -19,7 +31,7 @@ struct KaimonoListApp: App {
 
     var body: some Scene {
         WindowGroup {
-            if Self.isRunningUnitTests {
+            if AppEnvironment.isRunningUnitTests {
                 // Firebase 未構成のため、テスト時は bootstrap を呼ばず空表示にする
                 Color.clear
             } else {
@@ -32,12 +44,6 @@ struct KaimonoListApp: App {
                     }
             }
         }
-    }
-
-    /// XCTest / Swift Testing のホスト実行中かどうか。テスト時は
-    /// 環境変数 XCTestConfigurationFilePath がテストランナーによって設定される。
-    private static var isRunningUnitTests: Bool {
-        ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
     }
 }
 

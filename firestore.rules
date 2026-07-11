@@ -78,6 +78,13 @@ service cloud.firestore {
       match /purchaseHistory/{recordId} {
         allow read, write: if isMember(householdId);
       }
+
+      // プッシュ通知の送信先(FCM デバイストークン)。
+      // ドキュメントIDが FCM トークンそのもの。世帯メンバーだけが登録・削除できる。
+      // 通知の送信は Cloud Functions(Admin SDK)が行うため、ここは read/write のみで十分。
+      match /deviceTokens/{token} {
+        allow read, write: if isMember(householdId);
+      }
     }
   }
 }

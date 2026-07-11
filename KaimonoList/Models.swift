@@ -66,6 +66,11 @@ struct ShoppingItem: Identifiable, Codable, Equatable {
     var isChecked: Bool = false
     var addedByUid: String
     var addedByName: String         // 「誰が追加したか」を一覧に表示するため非正規化して持つ
+    /// 献立から展開された材料のとき、その料理名・絵文字を非正規化して持つ。
+    /// 買い物リストで「どの料理の材料か」を確認できるようにする。手動追加は nil。
+    /// (Optional なのでキー欠落でもデコードは失敗しない)
+    var sourceRecipeName: String?
+    var sourceRecipeEmoji: String?
     @ServerTimestamp var createdAt: Date?
     var checkedAt: Date?
 }
@@ -81,7 +86,17 @@ struct Recipe: Identifiable, Codable, Equatable {
     var emoji: String
     var ingredients: [RecipeIngredient]
     var memo: String?
+    /// このレシピの材料数量が「何人前の分量か」の基準。
+    /// 献立の人数とこの値の比率で買い物リストの数量をスケールする。
+    /// 既存レシピには無いプロパティなので Optional にしてデコード失敗を防ぐ
+    /// (nil = 未設定 → `baseServingsOrDefault` で既定人数として扱う)。
+    var baseServings: Int? = nil
     @ServerTimestamp var createdAt: Date?
+}
+
+extension Recipe {
+    /// 数量スケールの基準にする人数(nil を既定人数に丸める)
+    var baseServingsOrDefault: Int { baseServings ?? MealPlanEntry.defaultServings }
 }
 
 /// レシピ内の材料1件。配列としてレシピドキュメントに埋め込む
@@ -104,9 +119,20 @@ struct MealPlanEntry: Identifiable, Codable, Equatable {
     var recipeName: String      // レシピが後から削除されても表示できるよう非正規化
     var recipeEmoji: String
     var addedByUid: String
+    /// 何人前か。既存エントリには無いプロパティなので Optional にしてデコード失敗を防ぐ
+    /// (Optional は synthesized Decodable が decodeIfPresent 扱いでキー欠落を許容する)。
+    /// nil = 未設定 → 表示・保存時は `defaultServings` として扱う。
+    var servings: Int? = nil
     @ServerTimestamp var createdAt: Date?
     /// 材料を買い物リストへ展開した日時。nil = 未展開(ボタンの表示切り替えに使用)
     var ingredientsAddedAt: Date?
+}
+
+extension MealPlanEntry {
+    /// 人数未指定(既存エントリや nil)のときに使うデフォルト人数
+    static let defaultServings = 2
+    /// 表示・編集の基準にする人数(nil を defaultServings に丸める)
+    var servingsOrDefault: Int { servings ?? Self.defaultServings }
 }
 
 // MARK: - 購入履歴(好みの学習データ)
@@ -175,43 +201,68 @@ enum MealSuggester {
         var recipe: Recipe
         var score: Int
         var matchedIngredients: [String]   // 好みに一致した材料名(提案理由の表示用)
+        var seasonalMatches: [String]      // 旬に一致した材料名(提案理由の表示用)
     }
 
-    /// 品名の表記ゆれを吸収するための正規化(前後空白除去 + 小文字化)。
-    static func normalize(_ name: String) -> String {
+    /// スコア調整の重み(テストが挙動を検証するため定数として公開する)。
+    static let seasonalBonusPerIngredient = 3   // 旬の食材1つあたりの加点
+    static let recencyPenaltyPerCook = 4        // 直近に作った回数1回あたりの減点(マンネリ回避)
+
+    /// 品名の表記ゆれを吸収するための正規化(前後空白除去 + 小文字化)。純粋関数。
+    nonisolated static func normalize(_ name: String) -> String {
         name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 
     /// - Parameters:
     ///   - recipes: レシピ帳
     ///   - preferenceCounts: 正規化した品名 → 購入回数
+    ///   - seasonalIngredients: 当月の旬食材(正規化済み)。含む材料に加点する
+    ///   - recentCookCounts: recipeId → 直近に献立へ入れた回数。よく作ったものほど減点する
     ///   - excludedRecipeIds: すでに献立に入っているなど、提案対象から除外するレシピID
     ///   - limit: 返す最大件数
-    /// - Returns: スコア降順(同点はレシピ名昇順)の提案。スコア0のレシピは含めない。
+    /// - Returns: スコア降順(同点はレシピ名昇順)の提案。好みにも旬にも一致しないレシピ、
+    ///   および減点でスコアが0以下になったレシピは含めない。
     static func suggest(recipes: [Recipe],
                         preferenceCounts: [String: Int],
+                        seasonalIngredients: Set<String> = [],
+                        recentCookCounts: [String: Int] = [:],
                         excludedRecipeIds: Set<String>,
                         limit: Int) -> [Suggestion] {
-        guard limit > 0, !preferenceCounts.isEmpty else { return [] }
+        guard limit > 0 else { return [] }
+        // 好み(購入履歴)も旬情報も無ければ提案の根拠が無いので空を返す
+        guard !preferenceCounts.isEmpty || !seasonalIngredients.isEmpty else { return [] }
 
         var suggestions: [Suggestion] = []
         for recipe in recipes {
             guard let id = recipe.id, !excludedRecipeIds.contains(id) else { continue }
 
-            var score = 0
+            var preferenceScore = 0
             var matched: [String] = []
+            var seasonalMatched: [String] = []
             for ingredient in recipe.ingredients {
                 let key = normalize(ingredient.name)
                 guard !key.isEmpty else { continue }
                 // 完全一致 or 双方向の包含(「牛乳」⊂「低脂肪牛乳」等)でマッチ判定
                 if let count = matchedCount(for: key, in: preferenceCounts) {
-                    score += count
+                    preferenceScore += count
                     matched.append(ingredient.name)
                 }
+                if isSeasonalMatch(key, in: seasonalIngredients) {
+                    seasonalMatched.append(ingredient.name)
+                }
             }
+
+            // 好みにも旬にも一致しないレシピは提案しない(減点だけで残っても意味がない)
+            guard preferenceScore > 0 || !seasonalMatched.isEmpty else { continue }
+
+            let seasonalBonus = seasonalMatched.count * seasonalBonusPerIngredient
+            let penalty = (recentCookCounts[id] ?? 0) * recencyPenaltyPerCook
+            let score = preferenceScore + seasonalBonus - penalty
             guard score > 0 else { continue }
+
             suggestions.append(Suggestion(id: id, recipe: recipe, score: score,
-                                          matchedIngredients: matched))
+                                          matchedIngredients: matched,
+                                          seasonalMatches: seasonalMatched))
         }
 
         suggestions.sort {
@@ -229,5 +280,291 @@ enum MealSuggester {
             total += count
         }
         return total > 0 ? total : nil
+    }
+
+    /// 材料名(正規化済み)が旬食材に該当するか。品名一致と同様に双方向の包含も許す。
+    private static func isSeasonalMatch(_ key: String, in seasonal: Set<String>) -> Bool {
+        if seasonal.contains(key) { return true }
+        return seasonal.contains { $0.contains(key) || key.contains($0) }
+    }
+}
+
+// MARK: - 旬の食材テーブル(月ごとの代表的な食材)
+
+/// 献立提案で「旬の食材を使うレシピ」を後押しするための、月ごとの代表的な旬食材。
+/// 外部サービスに依存せずオフラインで動くよう、コードに直接持つ。
+enum SeasonalIngredients {
+
+    /// 端末の現在月の旬食材(正規化済み)。`MealSuggester.suggest` にそのまま渡せる。
+    static func current(now: Date = Date(), calendar: Calendar = .current) -> Set<String> {
+        let month = calendar.component(.month, from: now)
+        return Set(forMonth(month).map(MealSuggester.normalize))
+    }
+
+    /// 指定した月(1〜12)の旬食材。範囲外なら空配列。
+    static func forMonth(_ month: Int) -> [String] {
+        table[month] ?? []
+    }
+
+    private static let table: [Int: [String]] = [
+        1:  ["大根", "白菜", "ほうれん草", "ねぎ", "小松菜", "みかん", "りんご", "ぶり", "牡蠣"],
+        2:  ["大根", "白菜", "ほうれん草", "ねぎ", "キャベツ", "ぶり", "牡蠣", "いちご"],
+        3:  ["キャベツ", "菜の花", "たけのこ", "新玉ねぎ", "いちご", "あさり", "はまぐり"],
+        4:  ["たけのこ", "春キャベツ", "菜の花", "アスパラガス", "さやえんどう", "新玉ねぎ", "あさり"],
+        5:  ["アスパラガス", "そら豆", "グリンピース", "キャベツ", "新玉ねぎ", "いちご", "かつお"],
+        6:  ["なす", "トマト", "きゅうり", "ズッキーニ", "さやいんげん", "梅", "あじ"],
+        7:  ["なす", "トマト", "きゅうり", "とうもろこし", "ピーマン", "オクラ", "ゴーヤ", "枝豆", "すいか"],
+        8:  ["なす", "トマト", "きゅうり", "とうもろこし", "ピーマン", "オクラ", "ゴーヤ", "かぼちゃ", "枝豆"],
+        9:  ["さつまいも", "かぼちゃ", "なす", "しめじ", "まいたけ", "さんま", "ぶどう", "梨"],
+        10: ["さつまいも", "かぼちゃ", "しいたけ", "しめじ", "さんま", "鮭", "栗", "柿", "りんご"],
+        11: ["大根", "白菜", "ほうれん草", "ねぎ", "さつまいも", "れんこん", "鮭", "りんご", "みかん"],
+        12: ["大根", "白菜", "ねぎ", "ほうれん草", "れんこん", "ぶり", "牡蠣", "みかん"],
+    ]
+}
+
+// MARK: - 定番レシピのカタログ(アプリ内蔵の献立候補)
+
+/// 自分でレシピを登録していなくても「いろいろな料理」を選べるように、
+/// アプリに内蔵した定番レシピ集。外部サービスに依存せずオフラインで動くよう
+/// コードに直接持つ(旬食材テーブルと同じ方針)。
+///
+/// これらは Firestore には保存されていないため id は合成値(`idPrefix` 始まり)を持つ。
+/// 献立に選ばれた時点で初めてレシピ帳へ保存(マテリアライズ)し、
+/// 実際の Firestore ドキュメントIDを採番する(MealPlannerViewModel 側で処理)。
+enum RecipeCatalog {
+    /// カタログ由来のレシピを見分けるための id 接頭辞
+    static let idPrefix = "catalog-"
+
+    /// あるレシピがカタログ由来か(= まだ Firestore に保存されていないか)
+    static func isCatalog(_ recipe: Recipe) -> Bool {
+        recipe.id?.hasPrefix(idPrefix) ?? false
+    }
+
+    private static func make(_ slug: String, _ emoji: String, _ name: String,
+                             _ ingredients: [(String, String?)]) -> Recipe {
+        Recipe(
+            id: idPrefix + slug,
+            name: name,
+            emoji: emoji,
+            ingredients: ingredients.map { RecipeIngredient(name: $0.0, quantity: $0.1) },
+            memo: nil,
+            createdAt: nil
+        )
+    }
+
+    /// 定番レシピ一覧。肉・魚・麺・ごはん・鍋物など幅広いジャンルを揃える。
+    static let all: [Recipe] = [
+        make("curry",        "🍛", "カレーライス",
+             [("豚こま肉", "200g"), ("じゃがいも", "2個"), ("にんじん", "1本"),
+              ("玉ねぎ", "2個"), ("カレールー", "1箱"), ("米", "2合")]),
+        make("nikujaga",     "🥘", "肉じゃが",
+             [("牛こま肉", "200g"), ("じゃがいも", "3個"), ("にんじん", "1本"),
+              ("玉ねぎ", "1個"), ("しらたき", "1袋"), ("醤油", "大さじ3")]),
+        make("shogayaki",    "🍖", "豚の生姜焼き",
+             [("豚ロース", "300g"), ("玉ねぎ", "1個"), ("しょうが", "1片"),
+              ("キャベツ", "1/4個"), ("醤油", "大さじ2")]),
+        make("hamburg",      "🍔", "ハンバーグ",
+             [("合いびき肉", "300g"), ("玉ねぎ", "1個"), ("卵", "1個"),
+              ("パン粉", "適量"), ("ケチャップ", "適量")]),
+        make("karaage",      "🍗", "鶏の唐揚げ",
+             [("鶏もも肉", "400g"), ("にんにく", "1片"), ("しょうが", "1片"),
+              ("片栗粉", "適量"), ("醤油", "大さじ2")]),
+        make("oyakodon",     "🍚", "親子丼",
+             [("鶏もも肉", "200g"), ("卵", "3個"), ("玉ねぎ", "1個"),
+              ("めんつゆ", "適量"), ("米", "2合")]),
+        make("gyudon",       "🍚", "牛丼",
+             [("牛こま肉", "250g"), ("玉ねぎ", "1個"), ("しょうが", "1片"),
+              ("米", "2合"), ("醤油", "大さじ2")]),
+        make("mabodofu",     "🥘", "麻婆豆腐",
+             [("豚ひき肉", "150g"), ("豆腐", "1丁"), ("ねぎ", "1本"),
+              ("にんにく", "1片"), ("味噌", "大さじ1")]),
+        make("gyoza",        "🥟", "餃子",
+             [("豚ひき肉", "200g"), ("キャベツ", "1/4個"), ("にら", "1束"),
+              ("にんにく", "1片"), ("餃子の皮", "1袋")]),
+        make("teriyaki",     "🍗", "鶏の照り焼き",
+             [("鶏もも肉", "2枚"), ("醤油", "大さじ2"), ("みりん", "大さじ2"),
+              ("砂糖", "大さじ1")]),
+        make("tonkatsu",     "🍖", "とんかつ",
+             [("豚ロース", "2枚"), ("パン粉", "適量"), ("卵", "1個"),
+              ("キャベツ", "1/4個")]),
+        make("chinjao",      "🥘", "チンジャオロース",
+             [("牛肉", "200g"), ("ピーマン", "4個"), ("たけのこ", "1個"),
+              ("オイスターソース", "大さじ1")]),
+        make("hoikoro",      "🥘", "回鍋肉",
+             [("豚バラ肉", "200g"), ("キャベツ", "1/4個"), ("ピーマン", "2個"),
+              ("味噌", "大さじ1")]),
+        make("subuta",       "🥘", "酢豚",
+             [("豚肉", "250g"), ("玉ねぎ", "1個"), ("ピーマン", "2個"),
+              ("にんじん", "1本"), ("ケチャップ", "適量")]),
+        make("rollcabbage",  "🍲", "ロールキャベツ",
+             [("合いびき肉", "200g"), ("キャベツ", "6枚"), ("玉ねぎ", "1個"),
+              ("コンソメ", "適量")]),
+        make("tonjiru",      "🍲", "豚汁",
+             [("豚バラ肉", "150g"), ("大根", "1/4本"), ("にんじん", "1本"),
+              ("ごぼう", "1本"), ("豆腐", "1/2丁"), ("味噌", "適量")]),
+        make("nikudofu",     "🍲", "肉豆腐",
+             [("牛肉", "150g"), ("豆腐", "1丁"), ("ねぎ", "1本"), ("しらたき", "1袋")]),
+        make("shiozake",     "🐟", "鮭の塩焼き",
+             [("鮭", "2切れ"), ("塩", "適量"), ("大根", "適量")]),
+        make("sabamiso",     "🐟", "さばの味噌煮",
+             [("さば", "2切れ"), ("しょうが", "1片"), ("味噌", "大さじ2"),
+              ("みりん", "大さじ2")]),
+        make("buridaikon",   "🐟", "ぶり大根",
+             [("ぶり", "2切れ"), ("大根", "1/2本"), ("しょうが", "1片"),
+              ("醤油", "適量")]),
+        make("ebifry",       "🍤", "えびフライ",
+             [("えび", "8尾"), ("パン粉", "適量"), ("卵", "1個"),
+              ("キャベツ", "適量")]),
+        make("muniere",      "🐟", "白身魚のムニエル",
+             [("白身魚", "2切れ"), ("バター", "適量"), ("レモン", "1個"),
+              ("小麦粉", "適量")]),
+        make("nanban",       "🐟", "あじの南蛮漬け",
+             [("あじ", "4尾"), ("玉ねぎ", "1個"), ("にんじん", "1本"),
+              ("酢", "適量")]),
+        make("napolitan",    "🍝", "ナポリタン",
+             [("パスタ", "200g"), ("ウインナー", "4本"), ("玉ねぎ", "1個"),
+              ("ピーマン", "2個"), ("ケチャップ", "適量")]),
+        make("meatsauce",    "🍝", "ミートソースパスタ",
+             [("パスタ", "200g"), ("合いびき肉", "200g"), ("玉ねぎ", "1個"),
+              ("トマト缶", "1缶")]),
+        make("carbonara",    "🍝", "カルボナーラ",
+             [("パスタ", "200g"), ("ベーコン", "100g"), ("卵", "2個"),
+              ("生クリーム", "適量"), ("チーズ", "適量")]),
+        make("peperoncino",  "🍝", "ペペロンチーノ",
+             [("パスタ", "200g"), ("にんにく", "2片"), ("唐辛子", "適量"),
+              ("オリーブオイル", "適量")]),
+        make("yakisoba",     "🍜", "焼きそば",
+             [("中華麺", "3玉"), ("豚こま肉", "150g"), ("キャベツ", "1/4個"),
+              ("にんじん", "1本"), ("ソース", "適量")]),
+        make("chahan",       "🍚", "チャーハン",
+             [("米", "2合"), ("卵", "2個"), ("ねぎ", "1本"), ("ハム", "4枚")]),
+        make("omurice",      "🍳", "オムライス",
+             [("米", "2合"), ("鶏もも肉", "150g"), ("玉ねぎ", "1個"),
+              ("卵", "4個"), ("ケチャップ", "適量")]),
+        make("tendon",       "🍤", "天丼",
+             [("えび", "4尾"), ("なす", "1本"), ("さつまいも", "1/2本"),
+              ("米", "2合"), ("天ぷら粉", "適量")]),
+        make("nabeudon",     "🍜", "鍋焼きうどん",
+             [("うどん", "2玉"), ("鶏肉", "100g"), ("卵", "2個"),
+              ("ねぎ", "1本"), ("めんつゆ", "適量")]),
+        make("yasaiitame",   "🥘", "野菜炒め",
+             [("豚こま肉", "150g"), ("キャベツ", "1/4個"), ("もやし", "1袋"),
+              ("にんじん", "1本"), ("ピーマン", "2個")]),
+        make("gratin",       "🧀", "グラタン",
+             [("マカロニ", "100g"), ("鶏もも肉", "150g"), ("玉ねぎ", "1個"),
+              ("牛乳", "300ml"), ("チーズ", "適量")]),
+        make("stew",         "🍲", "クリームシチュー",
+             [("鶏もも肉", "200g"), ("じゃがいも", "2個"), ("にんじん", "1本"),
+              ("玉ねぎ", "1個"), ("牛乳", "300ml"), ("シチュールー", "1箱")]),
+        make("oden",         "🍢", "おでん",
+             [("大根", "1/2本"), ("卵", "4個"), ("こんにゃく", "1枚"),
+              ("ちくわ", "2本"), ("はんぺん", "1枚")]),
+        make("sukiyaki",     "🍲", "すき焼き",
+             [("牛肉", "400g"), ("白菜", "1/4個"), ("ねぎ", "1本"),
+              ("豆腐", "1丁"), ("しらたき", "1袋"), ("春菊", "1束")]),
+        make("okonomiyaki",  "🥞", "お好み焼き",
+             [("キャベツ", "1/4個"), ("豚バラ肉", "150g"), ("卵", "2個"),
+              ("小麦粉", "適量"), ("ソース", "適量")]),
+        make("croquette",    "🥔", "コロッケ",
+             [("じゃがいも", "4個"), ("合いびき肉", "150g"), ("玉ねぎ", "1個"),
+              ("パン粉", "適量")]),
+        make("hiyashi",      "🍜", "冷やし中華",
+             [("中華麺", "2玉"), ("きゅうり", "1本"), ("ハム", "4枚"),
+              ("卵", "2個"), ("トマト", "1個")]),
+        make("mabonasu",     "🥘", "麻婆茄子",
+             [("なす", "3本"), ("豚ひき肉", "150g"), ("ねぎ", "1本"),
+              ("味噌", "大さじ1")]),
+        make("ebichili",     "🍤", "エビチリ",
+             [("えび", "12尾"), ("ねぎ", "1本"), ("にんにく", "1片"),
+              ("ケチャップ", "適量")]),
+        make("happosai",     "🥘", "八宝菜",
+             [("豚肉", "100g"), ("白菜", "1/4個"), ("にんじん", "1本"),
+              ("しいたけ", "3個"), ("うずら卵", "適量")]),
+        make("misoshiru",    "🍲", "味噌汁",
+             [("豆腐", "1/2丁"), ("わかめ", "適量"), ("ねぎ", "1本"),
+              ("味噌", "適量")]),
+        make("salad",        "🥗", "サラダ",
+             [("レタス", "1/2個"), ("トマト", "1個"), ("きゅうり", "1本"),
+              ("ドレッシング", "適量")]),
+    ]
+}
+
+// MARK: - 献立削除時の材料クリーンアップ(買い物リストから消す材料の判定)
+
+/// 献立を削除したとき、買い物リストから消してよい材料名を求める純粋関数。
+/// Firestore に依存しないのでユニットテストから直接呼べる。
+/// 「他の残る献立でも使う材料は残す」というルールを表現する。
+enum MealPlanIngredientRemoval {
+    /// - Parameters:
+    ///   - deletedRecipe: 削除する献立のレシピ
+    ///   - remainingEntries: 削除後も残る献立エントリ(削除対象は除いておく)
+    ///   - recipesById: recipeId → Recipe の対応表
+    /// - Returns: 削除対象レシピの材料名のうち、他の残る献立では使わないものの集合。
+    ///   実際の削除側では、この集合に一致する「未購入」アイテムのみを消す。
+    static func namesToRemove(deletedRecipe: Recipe,
+                              remainingEntries: [MealPlanEntry],
+                              recipesById: [String: Recipe]) -> Set<String> {
+        var keep: Set<String> = []
+        for entry in remainingEntries {
+            guard let recipe = recipesById[entry.recipeId] else { continue }
+            keep.formUnion(recipe.ingredients.map(\.name))
+        }
+        return Set(deletedRecipe.ingredients.map(\.name)).subtracting(keep)
+    }
+}
+
+// MARK: - 材料数量の人数スケール(自由入力の数量を人数比で増減する)
+
+/// レシピの材料数量(「200g」「大さじ2」「1/2本」など自由入力)を、
+/// 基準人数から目標人数へ比率でスケールする純粋関数。
+/// Firestore に依存しないのでユニットテストから直接呼べる(CategoryGuesser と同じ方針)。
+///
+/// 文字列中に最初に現れる数値(整数・小数・分数 a/b)だけを比率倍し、単位や
+/// 「適量」などの非数値部分はそのまま残す。数値が無い/基準が不正な場合は原文を返す。
+enum IngredientScaler {
+    /// - Parameters:
+    ///   - quantity: 元の数量文字列(nil や数値なしはそのまま返す)
+    ///   - base: レシピの基準人数(> 0)
+    ///   - target: 目標人数(> 0)
+    static func scale(_ quantity: String?, from base: Int, to target: Int) -> String? {
+        guard let quantity else { return nil }
+        guard base > 0, target > 0, base != target else { return quantity }
+
+        let ns = quantity as NSString
+        // 最初の数値トークン(分数・小数・整数)を1つだけ対象にする
+        guard let regex = try? NSRegularExpression(pattern: #"\d+(?:\.\d+)?(?:/\d+)?"#),
+              let match = regex.firstMatch(in: quantity,
+                                           range: NSRange(location: 0, length: ns.length)) else {
+            return quantity
+        }
+
+        let token = ns.substring(with: match.range)
+        guard let value = numericValue(of: token) else { return quantity }
+        let scaled = formatNumber(value * Double(target) / Double(base))
+        return ns.replacingCharacters(in: match.range, with: scaled)
+    }
+
+    /// "1/2" → 0.5、"1.5" → 1.5、"200" → 200 を Double へ。解釈できなければ nil。
+    private static func numericValue(of token: String) -> Double? {
+        if token.contains("/") {
+            let parts = token.split(separator: "/")
+            guard parts.count == 2,
+                  let numerator = Double(parts[0]),
+                  let denominator = Double(parts[1]),
+                  denominator != 0 else { return nil }
+            return numerator / denominator
+        }
+        return Double(token)
+    }
+
+    /// 整数なら小数点なし、端数は小数第2位まで(末尾の0は落とす)で表示する。
+    private static func formatNumber(_ value: Double) -> String {
+        let rounded = (value * 100).rounded() / 100
+        if rounded == rounded.rounded() {
+            return String(Int(rounded.rounded()))
+        }
+        return String(format: "%.2f", rounded)
+            .replacingOccurrences(of: #"0+$"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: #"\.$"#, with: "", options: .regularExpression)
     }
 }

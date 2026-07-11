@@ -3,6 +3,8 @@ import SwiftUI
 struct ShoppingListView: View {
     @State private var viewModel: ShoppingListViewModel
     @State private var isShowingAddSheet = false
+    @State private var isConfirmingClearUnchecked = false
+    @State private var editingCategoryItem: ShoppingItem?
 
     init(householdId: String, currentUid: String, currentUserName: String) {
         _viewModel = State(initialValue: ShoppingListViewModel(
@@ -33,9 +35,24 @@ struct ShoppingListView: View {
                         }
                         .accessibilityLabel("アイテムを追加")
                     }
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Menu {
+                            Button("未購入をすべて削除", systemImage: "trash", role: .destructive) {
+                                isConfirmingClearUnchecked = true
+                            }
+                            .disabled(!hasUncheckedItems)
+                        } label: {
+                            Image(systemName: "ellipsis.circle")
+                        }
+                        .accessibilityLabel("その他の操作")
+                    }
                 }
                 .sheet(isPresented: $isShowingAddSheet) {
                     AddItemSheet(viewModel: viewModel)
+                        .presentationDetents([.medium, .large])
+                }
+                .sheet(item: $editingCategoryItem) { item in
+                    ChangeCategorySheet(viewModel: viewModel, item: item)
                         .presentationDetents([.medium, .large])
                 }
                 // 注意: onDisappear で stopListening しない。
@@ -47,7 +64,24 @@ struct ShoppingListView: View {
                 } message: {
                     Text(viewModel.errorMessage ?? "")
                 }
+                .confirmationDialog(
+                    "未購入をすべて削除",
+                    isPresented: $isConfirmingClearUnchecked,
+                    titleVisibility: .visible
+                ) {
+                    Button("すべて削除", role: .destructive) {
+                        viewModel.clearUnchecked()
+                    }
+                    Button("キャンセル", role: .cancel) {}
+                } message: {
+                    Text("未購入のアイテムをすべて削除します。購入済みは残ります。")
+                }
         }
+    }
+
+    /// 未購入アイテムが1件でもあるか(一括削除ボタンの活性判定)
+    private var hasUncheckedItems: Bool {
+        viewModel.items.contains { !$0.isChecked }
     }
 
     private var errorBinding: Binding<Bool> {
@@ -80,6 +114,12 @@ struct ShoppingListView: View {
                                 } label: {
                                     Label("削除", systemImage: "trash")
                                 }
+                                Button {
+                                    editingCategoryItem = item
+                                } label: {
+                                    Label("カテゴリ", systemImage: "tag")
+                                }
+                                .tint(.blue)
                             }
                         }
                     } header: {
@@ -123,6 +163,15 @@ private struct ItemRow: View {
                     Text(item.name)
                         .strikethrough(item.isChecked)
                         .foregroundStyle(item.isChecked ? .secondary : .primary)
+                    if let recipeName = item.sourceRecipeName {
+                        Label {
+                            Text(recipeName)
+                        } icon: {
+                            Text(item.sourceRecipeEmoji ?? "🍽️")
+                        }
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    }
                     Text(item.addedByName)
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
@@ -217,5 +266,65 @@ private struct AddItemSheet: View {
         selectedCategoryId = viewModel.defaultCategoryId
         lastAutoCategoryId = viewModel.defaultCategoryId
         isNameFocused = true
+    }
+}
+
+// MARK: - カテゴリ変更シート
+
+/// 既にリストにあるアイテムのカテゴリを選び直すシート。
+private struct ChangeCategorySheet: View {
+    let viewModel: ShoppingListViewModel
+    let item: ShoppingItem
+
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            List {
+                ForEach(viewModel.categories) { category in
+                    Button {
+                        viewModel.updateItemCategory(item, categoryId: category.id)
+                        dismiss()
+                    } label: {
+                        HStack(spacing: 12) {
+                            Text(category.emoji)
+                                .font(.title3)
+                            Text(category.name)
+                                .foregroundStyle(.primary)
+                            Spacer()
+                            if category.id == item.categoryId {
+                                Image(systemName: "checkmark")
+                                    .foregroundStyle(Color.accentColor)
+                            }
+                        }
+                    }
+                }
+
+                // 現在どのカテゴリにも属していない場合に「未分類」を選べるようにする
+                Button {
+                    viewModel.updateItemCategory(item, categoryId: nil)
+                    dismiss()
+                } label: {
+                    HStack(spacing: 12) {
+                        Text("❓")
+                            .font(.title3)
+                        Text("未分類")
+                            .foregroundStyle(.primary)
+                        Spacer()
+                        if item.categoryId == nil {
+                            Image(systemName: "checkmark")
+                                .foregroundStyle(Color.accentColor)
+                        }
+                    }
+                }
+            }
+            .navigationTitle(item.name)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("閉じる") { dismiss() }
+                }
+            }
+        }
     }
 }
