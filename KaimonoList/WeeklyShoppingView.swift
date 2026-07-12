@@ -65,7 +65,7 @@ struct WeeklyShoppingView: View {
             } header: {
                 Text("リストに追加する材料")
             } footer: {
-                Text("チェックした材料を追加します。数量はレシピの基準人数の分量です。材料名・数量の編集や削除・追加はレシピにも反映されます。")
+                Text("チェックした材料を追加します。材料名・数量の欄をタップすると書き換えられます。数量はレシピの基準人数の分量です。材料名・数量の編集・削除・追加はレシピにも反映されます。売り場カテゴリはタグから変更でき、この買い物リストにのみ反映されます。")
             }
 
             ForEach($recipes) { $recipe in
@@ -73,7 +73,8 @@ struct WeeklyShoppingView: View {
                     ForEach($recipe.ingredients) { $ingredient in
                         EditableIngredientRow(
                             ingredient: $ingredient,
-                            categoryLabel: viewModel.categoryLabel(for: ingredient.name)
+                            categories: viewModel.categories,
+                            guessCategoryId: { viewModel.categoryId(for: $0) }
                         )
                     }
                     .onDelete { offsets in
@@ -138,7 +139,8 @@ struct WeeklyShoppingView: View {
                     EditableIngredient(
                         id: ingredient.id,
                         name: ingredient.name,
-                        quantity: ingredient.quantity ?? ""
+                        quantity: ingredient.quantity ?? "",
+                        categoryId: viewModel.categoryId(for: ingredient.name)
                     )
                 }
             )
@@ -157,10 +159,18 @@ struct WeeklyShoppingView: View {
                 )
             }
             let selected = Set(recipe.ingredients.filter(\.isSelected).map(\.id))
+            // 画面で選んだカテゴリ(未選択の材料は含めず、追加時に品名から推定させる)
+            var categoryByIngredientId: [String: String] = [:]
+            for item in recipe.ingredients {
+                if let categoryId = item.categoryId {
+                    categoryByIngredientId[item.id] = categoryId
+                }
+            }
             return MealPlannerViewModel.WeeklyRecipeEdit(
                 recipeId: recipe.recipeId,
                 ingredients: ingredients,
-                selectedIngredientIds: selected
+                selectedIngredientIds: selected,
+                categoryByIngredientId: categoryByIngredientId
             )
         }
         await viewModel.applyWeeklyEditsAndAdd(edits)
@@ -179,22 +189,34 @@ private struct EditableRecipe: Identifiable {
     var id: String { recipeId }
 }
 
-/// まとめ買い画面で編集できる材料1件。チェックの有無・品名・数量を変更できる。
+/// まとめ買い画面で編集できる材料1件。チェックの有無・品名・数量・売り場カテゴリを変更できる。
 /// id は RecipeIngredient.id を引き継ぐ(新規追加行は新しい UUID を採番)。
 private struct EditableIngredient: Identifiable {
     var id: String = UUID().uuidString
     var name: String = ""
     var quantity: String = ""
+    /// 選んでいる売り場カテゴリのID。nil は未分類。
+    var categoryId: String? = nil
+    /// まだ手動でカテゴリを選んでいない間だけ true。品名の変更に追従して自動推定する。
+    var categoryIsAuto: Bool = true
     var isSelected: Bool = true
     var trimmedName: String { name.trimmingCharacters(in: .whitespaces) }
 }
 
 // MARK: - 材料の行
 
-/// 材料1件の編集行。チェック・品名(編集可)・売り場ラベル・数量(編集可)を表示する
+/// 材料1件の編集行。チェック・品名(編集可)・売り場カテゴリ(選択可)・数量(編集可)を表示する
 private struct EditableIngredientRow: View {
     @Binding var ingredient: EditableIngredient
-    let categoryLabel: String?
+    let categories: [ItemCategory]
+    /// 品名から売り場カテゴリを推定するクロージャ(まだ手動で選んでいない行に使う)
+    let guessCategoryId: (String) -> String?
+
+    /// 現在選んでいるカテゴリ(参照切れ・未選択なら nil)
+    private var selectedCategory: ItemCategory? {
+        guard let id = ingredient.categoryId else { return nil }
+        return categories.first { $0.id == id }
+    }
 
     var body: some View {
         HStack(spacing: 12) {
@@ -208,23 +230,76 @@ private struct EditableIngredientRow: View {
             .buttonStyle(.borderless)
             .accessibilityLabel(ingredient.isSelected ? "追加しない" : "追加する")
 
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: 6) {
                 TextField("材料名", text: $ingredient.name)
                     .foregroundStyle(ingredient.isSelected ? .primary : .secondary)
-                if let categoryLabel {
-                    Text(categoryLabel)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
+                    .editableFieldStyle()
+                    .onChange(of: ingredient.name) { _, newName in
+                        // 手動でカテゴリを選ぶまでは品名から自動推定する
+                        if ingredient.categoryIsAuto {
+                            ingredient.categoryId = guessCategoryId(newName)
+                        }
+                    }
+                categoryMenu
             }
 
-            Spacer()
+            Spacer(minLength: 8)
 
             TextField("数量", text: $ingredient.quantity)
                 .multilineTextAlignment(.trailing)
                 .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .frame(maxWidth: 100)
+                .frame(width: 96)
+                .editableFieldStyle()
         }
+        .padding(.vertical, 2)
+    }
+
+    /// 売り場カテゴリを選ぶメニュー。タップで一覧から変更でき、選ぶと自動推定を止める。
+    private var categoryMenu: some View {
+        Menu {
+            Picker("売り場", selection: categorySelection) {
+                Text("未分類").tag(String?.none)
+                ForEach(categories) { category in
+                    Text("\(category.emoji) \(category.name)").tag(category.id)
+                }
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "tag")
+                Text(selectedCategory.map { "\($0.emoji) \($0.name)" } ?? "未分類")
+                Image(systemName: "chevron.up.chevron.down")
+                    .font(.system(size: 9))
+            }
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+        }
+        .accessibilityLabel("売り場カテゴリ")
+    }
+
+    /// カテゴリ選択のバインディング。手動で選んだら自動推定を止める。
+    private var categorySelection: Binding<String?> {
+        Binding(
+            get: { ingredient.categoryId },
+            set: { newValue in
+                ingredient.categoryId = newValue
+                ingredient.categoryIsAuto = false
+            }
+        )
+    }
+}
+
+// MARK: - 入力欄の見た目
+
+private extension View {
+    /// タップして書き換えられることが伝わるよう、TextField を淡い背景と枠の「入力欄」に見せる
+    func editableFieldStyle() -> some View {
+        self
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+            .background(Color(.tertiarySystemFill), in: RoundedRectangle(cornerRadius: 8))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .strokeBorder(Color(.separator), lineWidth: 0.5)
+            )
     }
 }

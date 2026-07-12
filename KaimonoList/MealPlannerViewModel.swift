@@ -97,6 +97,12 @@ final class MealPlannerViewModel {
         return "\(category.emoji) \(category.name)"
     }
 
+    /// 品名から売り場カテゴリのドキュメントIDを推定する。推定できなければ nil(未分類)。
+    /// まとめ買いビューで各材料のカテゴリの初期値に使う。
+    func categoryId(for name: String) -> String? {
+        categoryId(forMatcherKey: CategoryGuesser.guessKey(from: name))
+    }
+
     // MARK: - 依存
 
     let householdId: String
@@ -551,6 +557,9 @@ final class MealPlannerViewModel {
         let ingredient: RecipeIngredient
         let recipeName: String
         let recipeEmoji: String
+        /// 買い物アイテムに付ける売り場カテゴリのID。nil は未分類。
+        /// 通常は品名からの推定値、まとめ買い画面では画面で選んだ値。
+        var categoryId: String?
     }
 
     /// 1件の献立の材料を買い物リストへ追加する
@@ -576,6 +585,9 @@ final class MealPlannerViewModel {
         let recipeId: String
         var ingredients: [RecipeIngredient]      // 編集後の全材料(レシピ帳へ保存)
         var selectedIngredientIds: Set<String>   // 買い物リストへ追加する材料(RecipeIngredient.id)
+        /// 画面で選んだ売り場カテゴリ(RecipeIngredient.id → categoryId)。
+        /// 未登録の材料は品名からの推定にフォールバックする。カテゴリはレシピには保存しない。
+        var categoryByIngredientId: [String: String]
     }
 
     /// まとめ買い画面の編集を確定する。追加ボタンの1操作で次を行う。
@@ -628,9 +640,13 @@ final class MealPlannerViewModel {
                     ingredient.quantity,
                     from: recipe.baseServingsOrDefault, to: entry.servingsOrDefault
                 )
+                // 画面で選んだカテゴリを優先し、無ければ品名から推定する
+                let categoryId = edit.categoryByIngredientId[ingredient.id]
+                    ?? self.categoryId(for: ingredient.name)
                 additions.append(IngredientToAdd(ingredient: scaled,
                                                  recipeName: recipe.name,
-                                                 recipeEmoji: recipe.emoji))
+                                                 recipeEmoji: recipe.emoji,
+                                                 categoryId: categoryId))
             }
         }
 
@@ -683,13 +699,14 @@ final class MealPlannerViewModel {
             scaled.quantity = IngredientScaler.scale(
                 ingredient.quantity, from: recipe.baseServingsOrDefault, to: servings
             )
-            return IngredientToAdd(ingredient: scaled, recipeName: recipe.name, recipeEmoji: recipe.emoji)
+            return IngredientToAdd(ingredient: scaled, recipeName: recipe.name, recipeEmoji: recipe.emoji,
+                                   categoryId: categoryId(for: ingredient.name))
         }
     }
 
     /// 材料を買い物アイテムとして一括追加し、追加した件数を返す。
     /// - 同じ品名が未購入リストに既にある場合はスキップ(数量の合算はしない)
-    /// - カテゴリは CategoryGuesser で推定。推定できなければ未分類のまま追加
+    /// - カテゴリは呼び出し側で解決済み(品名からの推定 or 画面での選択)。nil は未分類のまま追加
     /// - どの料理から追加したかを sourceRecipeName / sourceRecipeEmoji に記録する
     private func addToShoppingList(_ additions: [IngredientToAdd]) async throws -> Int {
         let snapshot = try await itemsRef
@@ -712,7 +729,7 @@ final class MealPlannerViewModel {
                 "sourceRecipeEmoji": addition.recipeEmoji,
                 "createdAt": FieldValue.serverTimestamp(),
             ]
-            if let categoryId = categoryId(forMatcherKey: CategoryGuesser.guessKey(from: ingredient.name)) {
+            if let categoryId = addition.categoryId {
                 data["categoryId"] = categoryId
             }
             if let quantity = ingredient.quantity {
