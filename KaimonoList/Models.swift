@@ -588,3 +588,66 @@ enum IngredientScaler {
             .replacingOccurrences(of: #"\.$"#, with: "", options: .regularExpression)
     }
 }
+
+// MARK: - 週間まとめ買い(1週間分の材料の集約)
+
+/// 1週間分の献立から、買い物リストへ追加する材料を品名ごとに集約する純粋関数。
+/// Firestore に依存しないのでユニットテストから直接呼べる(CategoryGuesser と同じ方針)。
+/// 数量は買い物リストへの展開と同じ比率(レシピの基準人数 → 献立の人数)でスケールし、
+/// 同じ品名は1件にまとめる。数量は合算せず、料理ごとの内訳として並べる
+/// (買い物リストへの追加も数量を合算しないため、表示と実際の挙動を一致させる)。
+enum WeeklyShoppingAggregator {
+
+    /// 集約後の材料1件。
+    struct Item: Identifiable, Equatable {
+        /// 品名(買い物アイテムの name と一致する)
+        var name: String
+        /// スケール済みの数量の内訳(同一表記は除く。数量未設定の材料は含めない)。
+        /// 例: 玉ねぎ → ["2個", "1個"]
+        var quantities: [String]
+        /// この材料を使う料理名(出現順・重複なし)。例: ["カレーライス", "肉じゃが"]
+        var recipeNames: [String]
+        var id: String { name }
+    }
+
+    /// - Parameters:
+    ///   - entries: 集約対象の献立エントリ(通常は材料未展開のもの)
+    ///   - recipesById: recipeId → Recipe
+    /// - Returns: 品名の出現順に並べた集約結果。参照先レシピが見つからないエントリは無視する。
+    static func aggregate(entries: [MealPlanEntry],
+                          recipesById: [String: Recipe]) -> [Item] {
+        var order: [String] = []                        // 品名の初出順を保つ
+        var quantitiesByName: [String: [String]] = [:]
+        var recipesByName: [String: [String]] = [:]
+
+        for entry in entries {
+            guard let recipe = recipesById[entry.recipeId] else { continue }
+            for ingredient in recipe.ingredients {
+                let name = ingredient.name
+                guard !name.isEmpty else { continue }
+                if quantitiesByName[name] == nil {
+                    order.append(name)
+                    quantitiesByName[name] = []
+                    recipesByName[name] = []
+                }
+                // 数量は献立の人数に合わせてスケール(買い物リストへの展開時と同じ計算)。
+                // すでに同じ表記があれば重ねない(「適量」などが並ぶのを防ぐ)。
+                if let scaled = IngredientScaler.scale(ingredient.quantity,
+                                                       from: recipe.baseServingsOrDefault,
+                                                       to: entry.servingsOrDefault),
+                   !(quantitiesByName[name]?.contains(scaled) ?? false) {
+                    quantitiesByName[name]?.append(scaled)
+                }
+                if !(recipesByName[name]?.contains(recipe.name) ?? false) {
+                    recipesByName[name]?.append(recipe.name)
+                }
+            }
+        }
+
+        return order.map { name in
+            Item(name: name,
+                 quantities: quantitiesByName[name] ?? [],
+                 recipeNames: recipesByName[name] ?? [])
+        }
+    }
+}

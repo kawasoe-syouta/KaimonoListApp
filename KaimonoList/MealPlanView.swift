@@ -15,6 +15,8 @@ struct MealPlanView: View {
     @State private var editRecipeTarget: MealPlanEntry?
     /// 「献立をすべて削除」の確認ダイアログの表示状態
     @State private var isConfirmingClearAll = false
+    /// 週間まとめ買いシートの表示状態
+    @State private var isShowingWeeklyShopping = false
 
     /// sheet(item:) に渡すためのラッパー(Date は Identifiable ではないので)
     private struct PickTarget: Identifiable {
@@ -36,12 +38,12 @@ struct MealPlanView: View {
                 if viewModel.pendingEntryCount > 0 {
                     Section {
                         Button {
-                            Task { await viewModel.addAllPendingIngredients() }
+                            isShowingWeeklyShopping = true
                         } label: {
-                            Label("今週の材料をまとめてリストへ", systemImage: "cart.badge.plus")
+                            Label("週間まとめ買い", systemImage: "cart.badge.plus")
                         }
                     } footer: {
-                        Text("同じ品名がすでに未購入リストにある材料は追加されません(数量の合算はしません)。")
+                        Text("1週間分の献立の材料をまとめて見て、一括で買い物リストへ追加できます。")
                     }
                 }
 
@@ -70,6 +72,9 @@ struct MealPlanView: View {
                     }
                     .accessibilityLabel("その他の操作")
                 }
+            }
+            .sheet(isPresented: $isShowingWeeklyShopping) {
+                WeeklyShoppingView(viewModel: viewModel)
             }
             .sheet(item: $pickTarget) { target in
                 RecipePickerSheet(viewModel: viewModel, date: target.date)

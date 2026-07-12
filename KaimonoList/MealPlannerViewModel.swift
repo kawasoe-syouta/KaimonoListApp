@@ -53,6 +53,50 @@ final class MealPlannerViewModel {
         planEntries.contains { $0.ingredientsAddedAt != nil }
     }
 
+    // MARK: - 週間まとめ買い
+
+    /// 週間まとめ買いビューの、カテゴリ(売り場)ごとにまとめた材料セクション。
+    struct WeeklyShoppingSection: Identifiable {
+        let category: ItemCategory?   // nil = 未分類
+        let items: [WeeklyShoppingAggregator.Item]
+        var id: String { category?.id ?? "__uncategorized__" }
+        /// セクション見出し(絵文字 + 名前。未分類は既定表記)
+        var title: String {
+            guard let category else { return "❓ 未分類" }
+            return "\(category.emoji) \(category.name)"
+        }
+    }
+
+    /// まだ材料を展開していない献立の材料を品名で集約し、買い物リストと同じ
+    /// カテゴリ順(売り場順・未分類は末尾)にグループ化して返す。週間まとめ買いビューで使う。
+    func weeklyShoppingSections() -> [WeeklyShoppingSection] {
+        let recipesById = Dictionary(
+            recipes.compactMap { recipe in recipe.id.map { ($0, recipe) } },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let pending = planEntries.filter { $0.ingredientsAddedAt == nil }
+        let items = WeeklyShoppingAggregator.aggregate(entries: pending, recipesById: recipesById)
+
+        // 品名 → 推定カテゴリID(未分類は nil キー)でまとめる
+        var itemsByCategoryId: [String?: [WeeklyShoppingAggregator.Item]] = [:]
+        for item in items {
+            let id = categoryId(forMatcherKey: CategoryGuesser.guessKey(from: item.name))
+            itemsByCategoryId[id, default: []].append(item)
+        }
+
+        // categories は sortOrder 昇順で保持しているので、その順でセクション化し、未分類は末尾へ
+        var sections: [WeeklyShoppingSection] = []
+        for category in categories {
+            guard let id = category.id,
+                  let items = itemsByCategoryId[id], !items.isEmpty else { continue }
+            sections.append(WeeklyShoppingSection(category: category, items: items))
+        }
+        if let uncategorized = itemsByCategoryId[nil], !uncategorized.isEmpty {
+            sections.append(WeeklyShoppingSection(category: nil, items: uncategorized))
+        }
+        return sections
+    }
+
     // MARK: - 依存
 
     let householdId: String
