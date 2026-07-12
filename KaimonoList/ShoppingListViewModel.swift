@@ -13,6 +13,20 @@ final class ShoppingListViewModel {
     private(set) var categories: [ItemCategory] = []   // sortOrder 順で保持
     var errorMessage: String?
 
+    /// 一括削除の直後に表示する「元に戻す」トースト。nil = 非表示。
+    /// 一定時間後に自動で消えるまで、undo() で削除を取り消せる。
+    var undoToast: UndoToast?
+
+    /// 「元に戻す」用に保持する、直前の一括削除の内容。
+    struct UndoToast: Identifiable {
+        let id = UUID()
+        let message: String
+        /// 復元するアイテム(ドキュメントIDごとそのまま書き戻す)
+        let removedItems: [ShoppingItem]
+        /// clearChecked で追加した購入履歴のドキュメントID(取り消し時に消す)
+        let addedHistoryIds: [String]
+    }
+
     /// 画面表示用: カテゴリごとにまとめた未購入アイテム
     struct CategoryGroup: Identifiable {
         let id: String        // categoryId または "uncategorized"
@@ -55,8 +69,23 @@ final class ShoppingListViewModel {
         return groups
     }
 
+    /// 購入済みアイテム。チェックした時刻(checkedAt)の新しい順に並べ、
+    /// 「今チェックしたもの」が上に来るようにする。checkedAt 未設定(旧データ)は末尾へ。
     var checkedItems: [ShoppingItem] {
         items.filter(\.isChecked)
+            .sorted { ($0.checkedAt ?? .distantPast) > ($1.checkedAt ?? .distantPast) }
+    }
+
+    /// 同名(前後空白を無視)の未購入アイテムがすでにリストにあるか。
+    /// 追加シートでの重複警告に使う。
+    func hasUncheckedItem(named name: String) -> Bool {
+        let target = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !target.isEmpty else { return false }
+        return items.contains {
+            !$0.isChecked &&
+            $0.name.trimmingCharacters(in: .whitespacesAndNewlines)
+                .caseInsensitiveCompare(target) == .orderedSame
+        }
     }
 
     /// 追加シートの初期選択に使うカテゴリ(「その他」→ なければ末尾)
@@ -177,32 +206,51 @@ final class ShoppingListViewModel {
         itemsRef.document(id).delete()
     }
 
-    /// アイテムのカテゴリを変更する。nil を渡すと「未分類」へ戻す。
-    func updateItemCategory(_ item: ShoppingItem, categoryId: String?) {
+    /// 既存アイテムの品名・数量・カテゴリをまとめて更新する。
+    /// 数量が空、カテゴリが nil のときは該当フィールドを削除して「未設定/未分類」に戻す。
+    func updateItem(_ item: ShoppingItem, name: String, quantity: String, categoryId: String?) {
         guard let id = item.id else { return }
-        if let categoryId {
-            itemsRef.document(id).updateData(["categoryId": categoryId])
-        } else {
-            itemsRef.document(id).updateData(["categoryId": FieldValue.delete()])
-        }
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty else { return }
+        let trimmedQuantity = quantity.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        var data: [String: Any] = ["name": trimmedName]
+        data["quantity"] = trimmedQuantity.isEmpty ? FieldValue.delete() : trimmedQuantity
+        data["categoryId"] = categoryId ?? FieldValue.delete()
+        itemsRef.document(id).updateData(data)
     }
 
     /// 未購入をまとめて削除(買わないと決めたものの一括クリア用)。
     /// 購入していないので purchaseHistory には記録しない。購入済みは残す。
+    /// 直後に「元に戻す」で復元できるよう、削除内容をトーストに保持する。
     func clearUnchecked() {
+        let removed = items.filter { !$0.isChecked }
+        guard !removed.isEmpty else { return }
+
         let batch = db.batch()
-        for item in items where !item.isChecked {
+        for item in removed {
             guard let id = item.id else { continue }
             batch.deleteDocument(itemsRef.document(id))
         }
         batch.commit()
+
+        undoToast = UndoToast(
+            message: "\(removed.count)件を削除しました",
+            removedItems: removed,
+            addedHistoryIds: []
+        )
     }
 
     /// 購入済みをまとめて削除(レジ後のリセット用)。
     /// 削除の前に purchaseHistory へ記録し、献立提案(MealSuggester)の学習データにする。
+    /// 直後に「元に戻す」で、アイテムの復元と購入履歴の取り消しの両方を行えるようにする。
     func clearChecked() {
+        let removed = checkedItems
+        guard !removed.isEmpty else { return }
+
         let batch = db.batch()
-        for item in checkedItems {
+        var historyIds: [String] = []
+        for item in removed {
             guard let id = item.id else { continue }
             // 購入履歴に記録(好みの学習データ)。categoryId は存在するときのみ持たせる
             var record: [String: Any] = [
@@ -213,10 +261,41 @@ final class ShoppingListViewModel {
             if let categoryId = item.categoryId {
                 record["categoryId"] = categoryId
             }
-            batch.setData(record, forDocument: purchaseHistoryRef.document())
+            let historyDoc = purchaseHistoryRef.document()
+            historyIds.append(historyDoc.documentID)
+            batch.setData(record, forDocument: historyDoc)
             batch.deleteDocument(itemsRef.document(id))
         }
         batch.commit()
+
+        undoToast = UndoToast(
+            message: "\(removed.count)件を削除しました",
+            removedItems: removed,
+            addedHistoryIds: historyIds
+        )
+    }
+
+    /// 直前の一括削除を取り消す。削除したアイテムを元のドキュメントIDのまま書き戻し、
+    /// (購入済み削除の場合は)追加した購入履歴も消す。
+    func undoLastClear() {
+        guard let toast = undoToast else { return }
+        undoToast = nil
+
+        let batch = db.batch()
+        for item in toast.removedItems {
+            guard let id = item.id else { continue }
+            // ドキュメントIDごと書き戻すので createdAt / checkedAt も含めて元通りになる
+            try? batch.setData(from: item, forDocument: itemsRef.document(id))
+        }
+        for historyId in toast.addedHistoryIds {
+            batch.deleteDocument(purchaseHistoryRef.document(historyId))
+        }
+        batch.commit()
+    }
+
+    /// トーストを閉じる(自動消滅・手動クローズ用)。復元はしない。
+    func dismissUndoToast() {
+        undoToast = nil
     }
 
     // MARK: - カテゴリ操作

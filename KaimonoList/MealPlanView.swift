@@ -9,6 +9,10 @@ struct MealPlanView: View {
     @State private var deleteTarget: MealPlanEntry?
     /// 人数編集シートの対象。nil = 非表示
     @State private var editServingsTarget: MealPlanEntry?
+    /// 材料確認シートの対象。nil = 非表示
+    @State private var detailTarget: MealPlanEntry?
+    /// 材料(レシピ)編集シートの対象。nil = 非表示
+    @State private var editRecipeTarget: MealPlanEntry?
     /// 「献立をすべて削除」の確認ダイアログの表示状態
     @State private var isConfirmingClearAll = false
 
@@ -76,6 +80,21 @@ struct MealPlanView: View {
                     Task { await viewModel.updateServings(entry, to: newServings) }
                 }
                 .presentationDetents([.height(220)])
+            }
+            .sheet(item: $detailTarget) { entry in
+                MealPlanDetailSheet(viewModel: viewModel, entry: entry)
+                    .presentationDetents([.medium, .large])
+            }
+            .sheet(item: $editRecipeTarget) { entry in
+                if let recipe = viewModel.recipe(for: entry) {
+                    RecipeEditSheet(title: "材料を編集", recipe: recipe) { name, emoji, ingredients, memo, baseServings in
+                        viewModel.updateRecipe(recipe, name: name, emoji: emoji,
+                                               ingredients: ingredients, memo: memo, baseServings: baseServings)
+                    }
+                } else {
+                    // レシピが削除済みの献立は編集できない旨を案内する
+                    RecipeUnavailableSheet()
+                }
             }
             // 注意: onDisappear で stopListening しない(レシピ帳へ push すると同期が止まるため)
             .onAppear { viewModel.startListening() }
@@ -181,6 +200,8 @@ struct MealPlanView: View {
                     Task { await viewModel.addIngredients(for: entry) }
                 } onEditServings: {
                     editServingsTarget = entry
+                } onShowDetail: {
+                    detailTarget = entry
                 }
                 .swipeActions {
                     Button(role: .destructive) {
@@ -188,12 +209,16 @@ struct MealPlanView: View {
                     } label: {
                         Label("削除", systemImage: "trash")
                     }
-                    Button {
-                        editServingsTarget = entry
-                    } label: {
-                        Label("人数", systemImage: "person.2")
+                    // 材料を買い物リストへ追加済みの献立は、編集してもリストへ反映されないため
+                    // 混乱を避けて編集を出さない(材料の確認はタップで引き続き可能)
+                    if entry.ingredientsAddedAt == nil {
+                        Button {
+                            editRecipeTarget = entry
+                        } label: {
+                            Label("編集", systemImage: "square.and.pencil")
+                        }
+                        .tint(.blue)
                     }
-                    .tint(.blue)
                 }
             }
         } header: {
@@ -231,6 +256,14 @@ private struct PlanRow: View {
     let entry: MealPlanEntry
     let onAddIngredients: () -> Void
     let onEditServings: () -> Void
+    let onShowDetail: () -> Void
+
+    /// 人数表示。編集可否で見た目を変えないよう、ボタン内でも静的表示でも共用する
+    private var servingsLabel: some View {
+        Label("\(entry.servingsOrDefault)人前", systemImage: "person.2.fill")
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+    }
 
     var body: some View {
         HStack(spacing: 12) {
@@ -238,13 +271,17 @@ private struct PlanRow: View {
                 .font(.title3)
             VStack(alignment: .leading, spacing: 2) {
                 Text(entry.recipeName)
-                Button(action: onEditServings) {
-                    Label("\(entry.servingsOrDefault)人前", systemImage: "person.2.fill")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
+                // 追加済み(材料展開済み)の献立は人数も編集不可にして静的表示にする。
+                // 未追加のときだけタップで人数編集シートを開く
+                if entry.ingredientsAddedAt == nil {
+                    Button(action: onEditServings) {
+                        servingsLabel
+                    }
+                    .buttonStyle(.borderless)   // 行全体へのタップ拡散を防ぐ
+                    .accessibilityLabel("\(entry.recipeName)の人数を変更(現在\(entry.servingsOrDefault)人前)")
+                } else {
+                    servingsLabel
                 }
-                .buttonStyle(.borderless)   // 行全体へのタップ拡散を防ぐ
-                .accessibilityLabel("\(entry.recipeName)の人数を変更(現在\(entry.servingsOrDefault)人前)")
             }
 
             Spacer()
@@ -262,6 +299,11 @@ private struct PlanRow: View {
                 .accessibilityLabel("\(entry.recipeName)の材料を買い物リストへ追加")
             }
         }
+        // 行(内側の borderless ボタン以外)をタップで材料確認シートを開く
+        .contentShape(Rectangle())
+        .onTapGesture(perform: onShowDetail)
+        .accessibilityAddTraits(.isButton)
+        .accessibilityHint("材料を確認")
     }
 }
 
@@ -363,6 +405,127 @@ private struct ServingsEditSheet: View {
                         onSave(servings)
                         dismiss()
                     }
+                }
+            }
+        }
+    }
+}
+
+// MARK: - 材料確認シート
+
+/// 献立に入れたレシピの材料を確認するシート。
+/// 数量は買い物リストへ展開するときと同じ比率(レシピの基準人数 → 献立の人数)で
+/// スケールして表示する。レシピが削除済みのときは確認できない旨を表示する。
+private struct MealPlanDetailSheet: View {
+    let viewModel: MealPlannerViewModel
+    let entry: MealPlanEntry
+
+    @Environment(\.dismiss) private var dismiss
+    /// 材料編集シート(レシピ編集)の表示状態
+    @State private var isEditing = false
+
+    /// 献立エントリに対応する最新のレシピ。編集後は同期で自動的に反映される
+    private var recipe: Recipe? { viewModel.recipe(for: entry) }
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if let recipe {
+                    ingredientsList(for: recipe)
+                } else {
+                    ContentUnavailableView(
+                        "レシピが見つかりません",
+                        systemImage: "book.closed",
+                        description: Text("このレシピは削除されたため、材料を表示・編集できません。")
+                    )
+                }
+            }
+            .navigationTitle("\(recipe?.emoji ?? entry.recipeEmoji) \(recipe?.name ?? entry.recipeName)")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                // 追加済みの献立は編集を出さない(編集してもリストへ反映されないため)
+                if recipe != nil, entry.ingredientsAddedAt == nil {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button("編集") { isEditing = true }
+                    }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("閉じる") { dismiss() }
+                }
+            }
+            .sheet(isPresented: $isEditing) {
+                if let recipe {
+                    RecipeEditSheet(title: "材料を編集", recipe: recipe) { name, emoji, ingredients, memo, baseServings in
+                        viewModel.updateRecipe(recipe, name: name, emoji: emoji,
+                                               ingredients: ingredients, memo: memo, baseServings: baseServings)
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func ingredientsList(for recipe: Recipe) -> some View {
+        List {
+            Section {
+                if recipe.ingredients.isEmpty {
+                    Text("材料が登録されていません")
+                        .foregroundStyle(.secondary)
+                }
+                ForEach(recipe.ingredients) { ingredient in
+                    HStack {
+                        Text(ingredient.name)
+                        Spacer()
+                        if let quantity = scaledQuantity(ingredient, in: recipe) {
+                            Text(quantity)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            } header: {
+                Text("\(entry.servingsOrDefault)人前の材料")
+            } footer: {
+                VStack(alignment: .leading, spacing: 4) {
+                    if recipe.baseServingsOrDefault != entry.servingsOrDefault {
+                        Text("数量はレシピの基準(\(recipe.baseServingsOrDefault)人前)から\(entry.servingsOrDefault)人前に合わせて調整して表示しています。")
+                    }
+                    if entry.ingredientsAddedAt != nil {
+                        Text("この献立は材料を買い物リストへ追加済みのため、材料は編集できません。")
+                    }
+                }
+            }
+
+            if let memo = recipe.memo, !memo.isEmpty {
+                Section("メモ") {
+                    Text(memo)
+                }
+            }
+        }
+    }
+
+    /// 材料の数量を献立の人数に合わせてスケールする(展開時と同じ計算)
+    private func scaledQuantity(_ ingredient: RecipeIngredient, in recipe: Recipe) -> String? {
+        IngredientScaler.scale(ingredient.quantity,
+                               from: recipe.baseServingsOrDefault,
+                               to: entry.servingsOrDefault)
+    }
+}
+
+/// レシピが削除済みの献立で編集を試みたときに表示する案内シート
+private struct RecipeUnavailableSheet: View {
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            ContentUnavailableView(
+                "レシピが見つかりません",
+                systemImage: "book.closed",
+                description: Text("このレシピは削除されたため、材料を編集できません。")
+            )
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("閉じる") { dismiss() }
                 }
             }
         }

@@ -1,120 +1,124 @@
-# 買い物リストアプリ セットアップ手順(MVP: カテゴリ別リスト + リアルタイム同期)
+# 買い物リストと献立 セットアップ手順
+
+家族で共有する買い物リスト + 献立プランナー(リアルタイム同期 / Sign in with Apple / プッシュ通知)。
 
 ## 前提
 - Mac + Xcode 16 以降
-- デプロイターゲット: **iOS 17.0 以上**(`@Observable` を使用しているため)
-- この段階では Apple Developer Program($99/年)は不要。シミュレータと手元の実機で動きます。
-  プッシュ通知・App Store 提出のフェーズで加入します。
+- デプロイターゲット: **iOS 17.0 以上**(`@Observable` を使用)
+- **Apple Developer Program($99/年)が必要**。Sign in with Apple / プッシュ通知の Capability、実機ビルド、App Store 提出に必須。
+- Firebase プロジェクト(Firestore + Auth + Cloud Messaging)。プッシュ通知の Functions を使う場合は **Blaze プラン**が必要。
 
 ## 1. プロジェクトを開く
 1. リポジトリを clone し、`KaimonoList.xcodeproj` を Xcode で開く
 2. Bundle Identifier は `com.kawasoe.KaimonoList`(Firebase 登録で使用。自分用に変える場合は
-   Signing & Capabilities で変更し、後述の Firebase 登録の Bundle ID も合わせる)
-3. Firebase SDK(`FirebaseAuth` / `FirebaseFirestore`)は Swift Package Manager で**統合済み**。
-   初回オープン時に自動でパッケージ解決が走ります(ネットワーク必要)
+   Signing & Capabilities で変更し、Firebase 登録の Bundle ID も合わせる)
+3. Firebase SDK(`FirebaseAuth` / `FirebaseFirestore` / `FirebaseMessaging`)は Swift Package Manager で
+   **統合済み**。初回オープン時に自動でパッケージ解決が走ります(ネットワーク必要)
+4. プロジェクトは **Xcode 16 の同期フォルダ**(`PBXFileSystemSynchronizedRootGroup`)構成。
+   `KaimonoList/` フォルダに置いたファイルは自動でターゲットに含まれます(pbxproj の個別参照は不要)
 
 ## 2. Firebase プロジェクト作成
-1. https://console.firebase.google.com → プロジェクトを追加(Analytics は任意、オフでOK)
+1. https://console.firebase.google.com → プロジェクトを追加
 2. 「iOS アプリを追加」→ 手順1の Bundle ID を入力
 3. **GoogleService-Info.plist** をダウンロードし、`KaimonoList/` フォルダに置く
    (同期フォルダ構成なので、フォルダに入れれば自動でターゲットへ含まれる。`.gitignore` 済み)
+   - ※未配置だと起動時に `FirebaseApp.configure()` でクラッシュします
 
-## 3. (SDK 追加は不要)
-Firebase SDK は上記のとおりプロジェクトに統合済みのため、手動追加は不要です。
-自分で追加し直す場合の設定: URL `https://github.com/firebase/firebase-ios-sdk` /
-Dependency Rule **Up to Next Major** / プロダクト `FirebaseAuth`・`FirebaseFirestore`。
-
-## 4. Firebase コンソール側の設定
-### Authentication
-- Build → Authentication → Sign-in method → **匿名** を有効化
-  (開発用。リリース前に Sign in with Apple に置き換え予定)
+## 3. Firebase コンソール側の設定
+### Authentication(Sign in with Apple)
+- Build → Authentication → Sign-in method → **Apple** を有効化
+- iOS ネイティブのサインインだけなら追加入力は不要ですが、**アカウント削除(退会)で
+  `revokeToken` を使う**ため、Apple プロバイダの OAuth 設定を入力しておく:
+  - Services ID(例 `com.kawasoe.KaimonoList.service`。Apple Developer ポータルで作成し、
+    Primary App ID = Bundle ID、Return URL = `https://<project>.firebaseapp.com/__/auth/handler`)
+  - Apple Team ID / Key ID / Sign in with Apple 用 `.p8` 秘密鍵
+  - ※`.p8` 秘密鍵は機密。漏洩時は Apple Keys で失効 → 再作成 → Firebase に貼り直し
 
 ### Firestore
 - Build → Firestore Database → データベースを作成
-- ロケーション: **asia-northeast1(東京)** 推奨
-- 「本番環境モード」で作成 → ルールタブに `firestore.rules` の内容を貼り付けて公開
+- ロケーション: **asia-northeast1(東京)**、本番環境モード
+- CLI で `firestore.rules` をデプロイ(下記「6. Firestore ルールのデプロイ」)
+
+### Cloud Messaging(プッシュ通知)
+- プロジェクト設定 → Cloud Messaging → Apple アプリの設定に、**APNs 認証キー(.p8)** を登録
+  (Key ID / Team ID とセット)。開発用 `.p8` は dev/prod 兼用のため本番用の追加登録は不要
+
+## 4. Xcode の署名と Capability
+1. TARGETS → KaimonoList → Signing & Capabilities でチーム(有料)を選択(自動署名)
+2. Capability を追加:
+   - **Sign in with Apple**(entitlements に `com.apple.developer.applesignin` = `["Default"]`)
+   - **Push Notifications**
+   - **Background Modes** → Remote notifications
+3. ※Capability の追加はビルド設定の変更なので Xcode UI で行う(コマンドラインからは変更しない)
 
 ## 5. ソースファイルの構成
 ソースは `KaimonoList/` フォルダに配置済み(clone すればそのまま揃っています):
 
 ```
 KaimonoList/
-├── KaimonoListApp.swift      ← @main(FirebaseApp.configure() 後に SessionStore を生成)
-├── Models.swift              ← データモデル・カテゴリ・カテゴリ推定・レシピ・献立
-├── SessionStore.swift        ← 匿名サインイン + 世帯(household)の初期化
-├── RootTabView.swift         ← ルート画面(リスト / 献立 のタブ切り替え)
-├── ShoppingListViewModel.swift
-├── ShoppingListView.swift    ← リスト画面 + 追加シート
-├── CategoryManageView.swift  ← カテゴリの追加・編集・並び替え画面
-├── MealPlannerViewModel.swift ← レシピ・献立の同期 + 食材展開
-├── MealPlanView.swift        ← 献立表(今日から7日分)+ レシピ選択シート
-├── RecipeListView.swift      ← レシピ帳 + 追加・編集シート
-├── HouseholdViewModel.swift  ← 世帯ドキュメントの同期(招待コード・メンバー・世帯名)
-└── HouseholdView.swift       ← 共有タブ(招待コード表示・参加・退出・世帯名編集)
+├── KaimonoListApp.swift       ← @main。Firebase 構成 → SignInView / RootTabView を出し分け
+├── SignInView.swift           ← サインインゲート(SignInWithAppleButton)
+├── SessionStore.swift         ← Sign in with Apple + 世帯の用意/参加/退出 + アカウント削除
+├── Models.swift               ← データモデル・カテゴリ推定・献立提案・旬食材・定番レシピ・数量スケール
+├── RootTabView.swift          ← リスト / 献立 / 共有 タブ + 初回オンボーディング表示
+├── OnboardingView.swift       ← 初回起動チュートリアル(4ページ)
+├── ShoppingListViewModel.swift / ShoppingListView.swift   ← 買い物リスト + 購入履歴記録
+├── CategoryManageView.swift   ← カテゴリの追加・編集・並び替え
+├── MealPlannerViewModel.swift / MealPlanView.swift / RecipeListView.swift  ← 献立・レシピ・おすすめ
+├── HouseholdViewModel.swift / HouseholdView.swift         ← 共有・メンバー・アカウント設定・退会
+├── PushNotifications.swift    ← FCM/APNs 連携(PushManager / AppDelegate)
+└── PrivacyInfo.xcprivacy      ← プライバシーマニフェスト
 ```
 
-※ フェーズ2から、App ファイルでサインイン完了後に表示するビューを
-   `ShoppingListView(...)` → `RootTabView(...)` に置き換えてください。
-   **フェーズ3で `RootTabView` の引数が変わりました。** サインイン完了後の表示を
-   `RootTabView(householdId:currentUid:currentUserName:)` から
-   **`RootTabView(session: sessionStore)`** に変更してください(SessionStore インスタンスをそのまま渡す)。
-   参加・退出でアクティブな世帯を切り替えるため、RootTabView が SessionStore を直接参照します。
+## 6. Firestore ルールのデプロイ
+`firebase.json` / `.firebaserc`(default プロジェクト)をコミット済み。
 
-## 6. 動作確認チェックリスト
-1. ビルド&実行 → 「準備中…」→ 空のリスト画面が表示される
-2. 「+」からアイテム追加。品名に「にんじん」と入れるとカテゴリが自動で「野菜・果物」になる
-3. Firebase コンソール → Firestore で `households/{id}/items` にデータが入っている
-4. **リアルタイム同期のデモ**: コンソール側で items にドキュメントを直接追加
-   (`name`: 文字列, `categoryId`: categories 内の任意のドキュメントID, `isChecked`: false,
-   `addedByUid`: 適当な文字列, `addedByName`: `"テスト"`, `createdAt`: timestamp)
-   → アプリを操作せずに即座に画面へ反映されればOK
-5. タップでチェック → 「購入済み」セクションへ移動 → まとめて削除
-6. 左上のタグアイコン → カテゴリ画面。「+」で追加、タップで編集、
-   「編集」ボタンからドラッグで並び替え・スワイプで削除ができる
-   → 並び替えた順序がリスト画面のセクション順に反映されればOK
+```sh
+firebase deploy --only firestore:rules
+```
 
-※ 2台間の共有(招待コードで参加)は次フェーズで Cloud Functions と一緒に実装します。
-   現状は起動した端末ごとに自分の世帯が1つ作られる仕様です。
+ルールの方針は「世帯メンバーだけがその世帯のデータを読み書きできる」。招待コードでの自己参加、
+`inviteCodes` の総当たり探索防止、`deviceTokens`(通知送信先)のメンバー限定書き込みを含む。
 
-## 7. フェーズ2(献立プランナー)の動作確認チェックリスト
-事前準備: **firestore.rules を更新したので、Firebase コンソールのルールタブに
-最新の内容を貼り直して「公開」する**(recipes / mealPlans の読み書き許可が追加されています)。
+## 7. Cloud Functions のデプロイ(プッシュ通知)
+`functions/index.js` の `notifyItemAdded`(2nd Gen / Node.js / asia-northeast1)が、
+`households/{id}/items/{itemId}` の onCreate を検知し、その世帯の `deviceTokens` を列挙して
+追加した本人以外へ通知を送る(無効トークンは自動削除)。
 
-1. 下のタブに「リスト」「献立」が表示される
-2. 献立タブ → 左上の本アイコン → レシピ帳。「+」でレシピを追加
-   (例:カレーライス / 材料:じゃがいも 3個、にんじん 1本、玉ねぎ 2個、豚こま 300g、カレールー 1箱)
-3. 献立タブに戻り、日付見出しの「+」からレシピを選んで割り当てる
-4. 献立行のカートアイコンをタップ → 「5件を買い物リストに追加しました」と表示され、
-   リストタブに材料がカテゴリ分類済みで入っている
-   (じゃがいも→野菜・果物、豚こま→肉、カレールー→缶詰・レトルト)
-5. 同じレシピをもう一度展開しても、未購入リストにある品名は重複追加されない
-6. 展開済みの献立は「追加済み」表示に変わる。複数日に割り当ててから
-   「今週の材料をまとめてリストへ」で一括展開もできる
-7. Firebase コンソール → `households/{id}/recipes` と `mealPlans` にデータが入っている。
-   2台目(または コンソール直編集)での変更が献立表に即時反映される
+```sh
+cd functions && npm install
+firebase deploy --only functions
+```
 
-## 8. フェーズ3(世帯の共有)の動作確認チェックリスト
-事前準備:
-- **firestore.rules を更新したので、Firebase コンソールのルールタブに最新の内容を貼り直して「公開」する**
-  (トップレベルの `inviteCodes` コレクションと、招待コードでの自己参加を許可する household の `update` ルールが追加されています)。
-- **App ファイルの表示を `RootTabView(session: sessionStore)` に変更する**(上記「5. ソースファイルの配置」の注記参照)。
+- 事前に **Blaze プラン**へのアップグレードが必要
+- 初回デプロイが `iam.serviceAccounts.ActAs denied` で失敗する場合は API 有効化直後の権限伝播待ち。
+  少し待って再実行すると成功する
+- メンテ課題: `functions/package.json` の Node.js ランタイム更新(古いバージョンは廃止予定)
 
-1. 下のタブに「リスト」「献立」「共有」が表示される
-2. 端末A:「共有」タブを開くと6桁の招待コードが表示される。リストタブで何品か追加しておく
-3. 端末B(別シミュレータ or 実機):「共有」タブ → 招待コード欄に端末Aのコードを入力 →
-   「この世帯に参加」→ 確認ダイアログで「参加する」
-   → リストタブに端末Aで追加した品が即座に同期されればOK
-4. 両端末の「共有」タブのメンバー一覧に2人が表示される(自分には「(あなた)」)
-5. 「招待を送る」でシート共有、「コードをコピー」でクリップボードにコピーできる
-6. 世帯名をタップして変更 → 他メンバーの画面にも即時反映される
-7. 端末Bで「この世帯から出る」→ 確認 → 自分専用の空リストに戻る。
-   端末Aのメンバー一覧から端末Bが消える
-8. 存在しないコードを入力すると「そのコードの世帯は見つかりません」と表示される
-9. Firebase コンソールで `inviteCodes/{コード}`(`householdId` を保持)と、
-   `households/{id}` の `memberIds` / `memberNames` にデータが入っている
+## 8. 動作確認チェックリスト
+### 認証・世帯
+1. 起動 → サインイン画面。Apple でサインインするとメイン画面へ(初回はオンボーディング表示)
+2. 別端末・再インストール後も、同じ Apple ID なら同じ世帯データに復帰する
+3. 「共有」タブ → アカウント設定から退会 → 再認証 → サインイン画面へ戻る
 
-## 次フェーズの予定
-1. Sign in with Apple(匿名アカウントからのリンク移行)
-2. FCM プッシュ通知(共有メンバーのアイテム追加を検知)
-3. 購入履歴の記録と、修正履歴から学習するカテゴリ辞書
-4. 世帯オーナー権限・他メンバーの管理(現状はメンバー相互信頼モデル)
+### 買い物リスト・カテゴリ
+1. 「+」からアイテム追加。「にんじん」→ カテゴリが自動で「野菜・果物」になる
+2. タップでチェック → 「購入済み」→ まとめて削除(このとき購入履歴に記録される)
+3. タグアイコン → カテゴリ画面で追加・編集・並び替え → リストのセクション順に反映される
+
+### 献立・おすすめ
+1. 献立タブ → 本アイコン → レシピ帳で登録、または内蔵の定番レシピカタログから選ぶ
+2. 日付の「+」でレシピを割り当て、人数を指定 → カートアイコンで材料を買い物リストへ展開
+   (人数に応じて分量がスケールされる。未購入リストにある品は重複追加されない)
+3. レシピ選択シートの「おすすめ」に、購入履歴・旬の食材・マンネリ回避を反映した提案が理由付きで出る
+
+### 共有・通知
+1. 端末A の招待コードを端末B に入力 → 参加 → リストが即時同期される
+2. 端末A でアイテムを追加すると端末B にプッシュ通知が届く(バックグラウンドで確認しやすい)
+3. 「この世帯から出る」で自分専用の空リストに戻る。メンバー一覧から消える
+
+## 将来課題
+- 購入履歴の肥大化対策(古い履歴の整理)
+- Cloud Functions の Node.js ランタイム更新
+- 世帯オーナー権限・メンバー管理(現状はメンバー相互信頼モデル)
+- 通知文言の拡張(カテゴリ別・まとめ通知・献立追加通知など)

@@ -48,4 +48,23 @@ struct CategoryGuesserTests {
     func matchesAsSubstring() {
         #expect(CategoryGuesser.guessKey(from: "国産若鶏もも肉 300g") == "meat")
     }
+
+    // MARK: - 除外語(誤検出の抑制)の検証
+
+    @Test("「フライパン」は「パン」で拾わず nil を返す(bread の除外語)")
+    func fryingPanIsNotBread() {
+        #expect(CategoryGuesser.guessKey(from: "フライパン") == nil)
+        // 通常のパンはこれまで通り bread になる
+        #expect(CategoryGuesser.guessKey(from: "食パン") == "bread")
+    }
+
+    @Test("「水菜」は飲料ではなく野菜に推定される(produce が beverage より前)")
+    func mizunaIsProduce() {
+        #expect(CategoryGuesser.guessKey(from: "水菜") == "produce")
+    }
+
+    @Test("「化粧水」は「水」で飲料に拾われず nil を返す(beverage の除外語)")
+    func lotionIsNotBeverage() {
+        #expect(CategoryGuesser.guessKey(from: "化粧水") == nil)
+    }
 }

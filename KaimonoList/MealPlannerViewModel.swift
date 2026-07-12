@@ -33,6 +33,11 @@ final class MealPlannerViewModel {
         return planEntries.filter { $0.date == key }
     }
 
+    /// 献立エントリに対応するレシピ。削除済みなら nil(材料確認画面で使用)
+    func recipe(for entry: MealPlanEntry) -> Recipe? {
+        recipes.first { $0.id == entry.recipeId }
+    }
+
     /// 材料をまだ買い物リストへ展開していない献立の数(まとめて追加ボタンの表示判定)
     var pendingEntryCount: Int {
         planEntries.filter { $0.ingredientsAddedAt == nil }.count
