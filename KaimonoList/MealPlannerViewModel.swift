@@ -53,48 +53,48 @@ final class MealPlannerViewModel {
         planEntries.contains { $0.ingredientsAddedAt != nil }
     }
 
-    // MARK: - 週間まとめ買い
+    // MARK: - 週間まとめ買い(レシピ別に編集して追加)
 
-    /// 週間まとめ買いビューの、カテゴリ(売り場)ごとにまとめた材料セクション。
-    struct WeeklyShoppingSection: Identifiable {
-        let category: ItemCategory?   // nil = 未分類
-        let items: [WeeklyShoppingAggregator.Item]
-        var id: String { category?.id ?? "__uncategorized__" }
-        /// セクション見出し(絵文字 + 名前。未分類は既定表記)
-        var title: String {
-            guard let category else { return "❓ 未分類" }
-            return "\(category.emoji) \(category.name)"
+    /// まとめ買い画面のレシピ単位のグループ。レシピ本来の分量(基準人数)をそのまま
+    /// 編集対象にし、確定時にレシピ帳へ反映する。買い物リストへは献立の人数にスケールして追加する。
+    struct WeeklyRecipeGroup: Identifiable {
+        let recipeId: String
+        let recipeName: String
+        let recipeEmoji: String
+        let baseServings: Int
+        let ingredients: [RecipeIngredient]   // 基準人数の分量(未スケール)
+        var id: String { recipeId }
+    }
+
+    /// まだ材料を展開していない献立を、レシピ単位でまとめて返す(初出順・同じレシピは1件)。
+    /// レシピが解決できない(削除済み)エントリは除く。まとめ買いビューで使う。
+    func weeklyRecipeGroups() -> [WeeklyRecipeGroup] {
+        var order: [String] = []
+        var seen: Set<String> = []
+        for entry in planEntries where entry.ingredientsAddedAt == nil {
+            let id = entry.recipeId
+            guard !seen.contains(id), recipes.contains(where: { $0.id == id }) else { continue }
+            seen.insert(id)
+            order.append(id)
+        }
+        return order.compactMap { id in
+            guard let recipe = recipes.first(where: { $0.id == id }) else { return nil }
+            return WeeklyRecipeGroup(
+                recipeId: id,
+                recipeName: recipe.name,
+                recipeEmoji: recipe.emoji,
+                baseServings: recipe.baseServingsOrDefault,
+                ingredients: recipe.ingredients
+            )
         }
     }
 
-    /// まだ材料を展開していない献立の材料を品名で集約し、買い物リストと同じ
-    /// カテゴリ順(売り場順・未分類は末尾)にグループ化して返す。週間まとめ買いビューで使う。
-    func weeklyShoppingSections() -> [WeeklyShoppingSection] {
-        let recipesById = Dictionary(
-            recipes.compactMap { recipe in recipe.id.map { ($0, recipe) } },
-            uniquingKeysWith: { first, _ in first }
-        )
-        let pending = planEntries.filter { $0.ingredientsAddedAt == nil }
-        let items = WeeklyShoppingAggregator.aggregate(entries: pending, recipesById: recipesById)
-
-        // 品名 → 推定カテゴリID(未分類は nil キー)でまとめる
-        var itemsByCategoryId: [String?: [WeeklyShoppingAggregator.Item]] = [:]
-        for item in items {
-            let id = categoryId(forMatcherKey: CategoryGuesser.guessKey(from: item.name))
-            itemsByCategoryId[id, default: []].append(item)
-        }
-
-        // categories は sortOrder 昇順で保持しているので、その順でセクション化し、未分類は末尾へ
-        var sections: [WeeklyShoppingSection] = []
-        for category in categories {
-            guard let id = category.id,
-                  let items = itemsByCategoryId[id], !items.isEmpty else { continue }
-            sections.append(WeeklyShoppingSection(category: category, items: items))
-        }
-        if let uncategorized = itemsByCategoryId[nil], !uncategorized.isEmpty {
-            sections.append(WeeklyShoppingSection(category: nil, items: uncategorized))
-        }
-        return sections
+    /// 品名から売り場カテゴリの見出し(絵文字 + 名前)を返す。推定できなければ nil。
+    /// まとめ買いビューで各材料の売り場ラベルを表示するために使う。
+    func categoryLabel(for name: String) -> String? {
+        guard let id = categoryId(forMatcherKey: CategoryGuesser.guessKey(from: name)),
+              let category = categories.first(where: { $0.id == id }) else { return nil }
+        return "\(category.emoji) \(category.name)"
     }
 
     // MARK: - 依存
@@ -570,33 +570,74 @@ final class MealPlannerViewModel {
         }
     }
 
-    /// 週間まとめ買いの確認画面で選択・編集した材料1件。
-    /// 集約結果をユーザーが確認画面で編集(数量の書き換え・不要な材料の除外)した後の値を表す。
-    struct EditedIngredient {
-        var name: String
-        var quantity: String?
-        var recipeName: String
-        var recipeEmoji: String
+    /// まとめ買いの確認画面で編集したレシピ1件分。材料の全体(レシピへ保存する内容)と、
+    /// そのうち買い物リストへ追加する材料(選択されたもの)を持つ。
+    struct WeeklyRecipeEdit {
+        let recipeId: String
+        var ingredients: [RecipeIngredient]      // 編集後の全材料(レシピ帳へ保存)
+        var selectedIngredientIds: Set<String>   // 買い物リストへ追加する材料(RecipeIngredient.id)
     }
 
-    /// 確認画面で選んだ材料だけを買い物リストへ追加し、未展開の献立を「追加済み」にする。
-    /// 数量はユーザーが編集した値をそのまま使う(集約時のスケール済みの値を書き換え可能)。
-    func addSelectedWeeklyIngredients(_ items: [EditedIngredient]) async {
-        guard !items.isEmpty else { return }
-        // レシピが解決できる未展開の献立を「追加済み」にする(まとめて追加と同じ扱い)
-        let resolvedEntries = planEntries.filter { entry in
+    /// まとめ買い画面の編集を確定する。追加ボタンの1操作で次を行う。
+    /// 1) 材料が変わったレシピをレシピ帳へ保存(基準人数の分量をそのまま反映)、
+    /// 2) 選択された材料を各献立の人数にスケールして買い物リストへ追加、
+    /// 3) 対象の未展開献立を「追加済み」にする。
+    func applyWeeklyEditsAndAdd(_ edits: [WeeklyRecipeEdit]) async {
+        guard !edits.isEmpty else { return }
+
+        // レシピが解決できる未展開の献立(まとめ買いの対象)
+        let pending = planEntries.filter { entry in
             entry.ingredientsAddedAt == nil && recipes.contains { $0.id == entry.recipeId }
         }
-        let additions = items.map { item in
-            IngredientToAdd(
-                ingredient: RecipeIngredient(name: item.name, quantity: item.quantity),
-                recipeName: item.recipeName,
-                recipeEmoji: item.recipeEmoji
-            )
+        guard !pending.isEmpty else { return }
+
+        let editsById = Dictionary(edits.map { ($0.recipeId, $0) },
+                                   uniquingKeysWith: { first, _ in first })
+
+        // 1) 編集内容をレシピ帳へ反映(材料が変わったレシピだけ書き込む)。
+        //    以降のスケール計算にも編集後の材料を使うため editedRecipesById に控える。
+        var editedRecipesById: [String: Recipe] = [:]
+        let recipeBatch = db.batch()
+        var recipeWrites = 0
+        for edit in edits {
+            guard let recipe = recipes.first(where: { $0.id == edit.recipeId }),
+                  let id = recipe.id else { continue }
+            var updated = recipe
+            updated.ingredients = cleanedIngredients(edit.ingredients)
+            editedRecipesById[id] = updated
+            guard updated.ingredients != recipe.ingredients else { continue }
+            do {
+                try recipeBatch.setData(from: updated, forDocument: recipesRef.document(id))
+                recipeWrites += 1
+            } catch {
+                errorMessage = error.localizedDescription
+                return
+            }
         }
+
+        // 2) 選択された材料を、各献立の人数にスケールして追加候補にする。
+        //    同じレシピが複数の献立にあるときは addToShoppingList 側で品名重複を除く。
+        var additions: [IngredientToAdd] = []
+        for entry in pending {
+            guard let recipe = editedRecipesById[entry.recipeId],
+                  let edit = editsById[entry.recipeId] else { continue }
+            for ingredient in recipe.ingredients
+            where edit.selectedIngredientIds.contains(ingredient.id) {
+                var scaled = ingredient
+                scaled.quantity = IngredientScaler.scale(
+                    ingredient.quantity,
+                    from: recipe.baseServingsOrDefault, to: entry.servingsOrDefault
+                )
+                additions.append(IngredientToAdd(ingredient: scaled,
+                                                 recipeName: recipe.name,
+                                                 recipeEmoji: recipe.emoji))
+            }
+        }
+
         do {
+            if recipeWrites > 0 { try await recipeBatch.commit() }
             let addedCount = try await addToShoppingList(additions)
-            markIngredientsAdded(resolvedEntries)
+            markIngredientsAdded(pending)
             infoMessage = addedCount == 0
                 ? "材料はすべてリストにあります"
                 : "\(addedCount)件を買い物リストに追加しました"

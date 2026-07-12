@@ -403,6 +403,8 @@ private struct EditItemSheet: View {
     @State private var name: String
     @State private var quantity: String
     @State private var selectedCategoryId: String?
+    /// 紐づける料理のレシピID。nil = 料理なし。
+    @State private var selectedRecipeId: String?
     @FocusState private var isNameFocused: Bool
 
     init(viewModel: ShoppingListViewModel, item: ShoppingItem) {
@@ -411,6 +413,10 @@ private struct EditItemSheet: View {
         _name = State(initialValue: item.name)
         _quantity = State(initialValue: item.quantity ?? "")
         _selectedCategoryId = State(initialValue: item.categoryId)
+        // アイテムには料理名しか持たないので、同名のレシピを選択の初期値にする
+        // (該当レシピが無い/削除済みなら「なし」始まり)
+        _selectedRecipeId = State(initialValue: viewModel.recipes
+            .first(where: { $0.name == item.sourceRecipeName })?.id)
     }
 
     var body: some View {
@@ -431,6 +437,17 @@ private struct EditItemSheet: View {
                             .tag(category.id)
                     }
                 }
+
+                // このアイテムがどの料理の材料かを紐づける(任意)
+                if !viewModel.recipes.isEmpty {
+                    Picker("料理", selection: $selectedRecipeId) {
+                        Text("なし").tag(String?.none)
+                        ForEach(viewModel.recipes) { recipe in
+                            Text("\(recipe.emoji) \(recipe.name)")
+                                .tag(recipe.id)
+                        }
+                    }
+                }
             }
             .navigationTitle("アイテムを編集")
             .navigationBarTitleDisplayMode(.inline)
@@ -449,7 +466,12 @@ private struct EditItemSheet: View {
     private func save() {
         let trimmed = name.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty else { return }
-        viewModel.updateItem(item, name: trimmed, quantity: quantity, categoryId: selectedCategoryId)
+        let recipe = viewModel.recipes.first { $0.id == selectedRecipeId }
+        viewModel.updateItem(item,
+                             name: trimmed,
+                             quantity: quantity,
+                             categoryId: selectedCategoryId,
+                             recipe: recipe)
         dismiss()
     }
 }

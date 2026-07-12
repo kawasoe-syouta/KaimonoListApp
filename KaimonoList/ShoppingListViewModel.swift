@@ -11,6 +11,7 @@ final class ShoppingListViewModel {
 
     private(set) var items: [ShoppingItem] = []
     private(set) var categories: [ItemCategory] = []   // sortOrder 順で保持
+    private(set) var recipes: [Recipe] = []            // 編集シートでアイテムに紐づける料理の選択肢
     var errorMessage: String?
 
     /// 一括削除の直後に表示する「元に戻す」トースト。nil = 非表示。
@@ -108,12 +109,14 @@ final class ShoppingListViewModel {
     private let db = Firestore.firestore()
     private var itemsListener: ListenerRegistration?
     private var categoriesListener: ListenerRegistration?
+    private var recipesListener: ListenerRegistration?
 
     private var householdRef: DocumentReference {
         db.collection("households").document(householdId)
     }
     private var itemsRef: CollectionReference { householdRef.collection("items") }
     private var categoriesRef: CollectionReference { householdRef.collection("categories") }
+    private var recipesRef: CollectionReference { householdRef.collection("recipes") }
     private var purchaseHistoryRef: CollectionReference { householdRef.collection("purchaseHistory") }
 
     init(householdId: String, currentUid: String, currentUserName: String) {
@@ -159,13 +162,30 @@ final class ShoppingListViewModel {
                     try? $0.data(as: ShoppingItem.self)
                 } ?? []
             }
+
+        recipesListener = recipesRef
+            .order(by: "createdAt")
+            .addSnapshotListener { [weak self] snapshot, error in
+                guard let self else { return }
+                if let error {
+                    // 退出・世帯切り替え時の権限エラーは自然に起きるので警告しない
+                    if error.isFirestorePermissionDenied { return }
+                    self.errorMessage = error.localizedDescription
+                    return
+                }
+                self.recipes = snapshot?.documents.compactMap {
+                    try? $0.data(as: Recipe.self)
+                } ?? []
+            }
     }
 
     func stopListening() {
         itemsListener?.remove()
         categoriesListener?.remove()
+        recipesListener?.remove()
         itemsListener = nil
         categoriesListener = nil
+        recipesListener = nil
     }
 
     // MARK: - アイテム操作
@@ -206,9 +226,14 @@ final class ShoppingListViewModel {
         itemsRef.document(id).delete()
     }
 
-    /// 既存アイテムの品名・数量・カテゴリをまとめて更新する。
-    /// 数量が空、カテゴリが nil のときは該当フィールドを削除して「未設定/未分類」に戻す。
-    func updateItem(_ item: ShoppingItem, name: String, quantity: String, categoryId: String?) {
+    /// 既存アイテムの品名・数量・カテゴリ・紐づく料理をまとめて更新する。
+    /// 数量が空、カテゴリが nil、レシピ未選択のときは該当フィールドを削除して
+    /// 「未設定/未分類/料理なし」に戻す。
+    func updateItem(_ item: ShoppingItem,
+                    name: String,
+                    quantity: String,
+                    categoryId: String?,
+                    recipe: Recipe?) {
         guard let id = item.id else { return }
         let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedName.isEmpty else { return }
@@ -217,6 +242,9 @@ final class ShoppingListViewModel {
         var data: [String: Any] = ["name": trimmedName]
         data["quantity"] = trimmedQuantity.isEmpty ? FieldValue.delete() : trimmedQuantity
         data["categoryId"] = categoryId ?? FieldValue.delete()
+        // 料理を選んだらその名前・絵文字を非正規化して持たせ、「なし」なら関連を外す
+        data["sourceRecipeName"] = recipe?.name ?? FieldValue.delete()
+        data["sourceRecipeEmoji"] = recipe.map { $0.emoji } ?? FieldValue.delete()
         itemsRef.document(id).updateData(data)
     }
 

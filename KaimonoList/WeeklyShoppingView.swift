@@ -1,31 +1,36 @@
 import SwiftUI
 
 /// まとめてリストに追加するビュー。今週(今日から7日分)の献立のうち、まだ買い物リストへ
-/// 展開していない材料を品名で集約し、売り場(カテゴリ)順に一覧する。
-/// 確認画面で材料の選択(チェック)・数量の書き換え・スワイプ除外を行い、
-/// 下部の「まとめてリストに追加」で、選んだ材料だけを買い物リストへ追加できる。
+/// 展開していない材料を、レシピごとのセクションで一覧する。
+/// レシピ本来の分量(基準人数)を直接編集でき、追加時にその編集内容をレシピ帳へも反映する。
+/// 各材料には売り場(カテゴリ)のラベルを添えて表示する。
+/// 下部の「まとめてリストに追加」で、チェックした材料を献立の人数にスケールして買い物リストへ追加する。
 struct WeeklyShoppingView: View {
     let viewModel: MealPlannerViewModel
     @Environment(\.dismiss) private var dismiss
 
-    /// 画面表示中に編集できるよう、集約結果を一度だけローカル状態へ取り込む
-    @State private var sections: [EditableSection] = []
+    /// 画面表示中に編集できるよう、レシピ単位のグループを一度だけローカル状態へ取り込む
+    @State private var recipes: [EditableRecipe] = []
     @State private var didLoad = false
 
-    /// チェックの付いた(追加対象の)材料の総数
+    /// チェックの付いた(追加対象の)材料の総数(品名が空の行は数えない)
     private var selectedCount: Int {
-        sections.reduce(0) { $0 + $1.items.filter(\.isSelected).count }
+        recipes.reduce(0) { total, recipe in
+            total + recipe.ingredients.filter { $0.isSelected && !$0.trimmedName.isEmpty }.count
+        }
     }
 
-    /// 表示中の材料の総品数(除外していない分)
+    /// 表示中の材料の総品数(品名が空の行は数えない)
     private var itemCount: Int {
-        sections.reduce(0) { $0 + $1.items.count }
+        recipes.reduce(0) { total, recipe in
+            total + recipe.ingredients.filter { !$0.trimmedName.isEmpty }.count
+        }
     }
 
     var body: some View {
         NavigationStack {
             Group {
-                if itemCount == 0 {
+                if recipes.isEmpty {
                     ContentUnavailableView(
                         "追加できる材料はありません",
                         systemImage: "cart",
@@ -45,9 +50,9 @@ struct WeeklyShoppingView: View {
             .safeAreaInset(edge: .bottom) { addBar }
         }
         .task {
-            // 表示のたびにリセットしないよう初回のみ集約結果を取り込む
+            // 表示のたびにリセットしないよう初回のみ取り込む
             guard !didLoad else { return }
-            sections = makeEditableSections()
+            recipes = makeEditableRecipes()
             didLoad = true
         }
     }
@@ -55,23 +60,39 @@ struct WeeklyShoppingView: View {
     private var list: some View {
         List {
             Section {
-                LabeledContent("料理", value: "\(viewModel.pendingEntryCount)品")
+                LabeledContent("料理", value: "\(recipes.count)品")
                 LabeledContent("材料", value: "\(selectedCount)/\(itemCount)品目")
             } header: {
                 Text("リストに追加する材料")
             } footer: {
-                Text("チェックを外すと追加しません。数量は直接書き換えられます。左スワイプで材料を除外できます。")
+                Text("チェックした材料を追加します。数量はレシピの基準人数の分量です。材料名・数量の編集や削除・追加はレシピにも反映されます。")
             }
 
-            ForEach($sections) { $section in
-                if !section.items.isEmpty {
-                    Section(section.title) {
-                        ForEach($section.items) { $item in
-                            EditableShoppingRow(item: $item)
-                        }
-                        .onDelete { offsets in
-                            $section.items.wrappedValue.remove(atOffsets: offsets)
-                        }
+            ForEach($recipes) { $recipe in
+                Section {
+                    ForEach($recipe.ingredients) { $ingredient in
+                        EditableIngredientRow(
+                            ingredient: $ingredient,
+                            categoryLabel: viewModel.categoryLabel(for: ingredient.name)
+                        )
+                    }
+                    .onDelete { offsets in
+                        $recipe.ingredients.wrappedValue.remove(atOffsets: offsets)
+                    }
+
+                    Button {
+                        $recipe.ingredients.wrappedValue.append(EditableIngredient())
+                    } label: {
+                        Label("材料を追加", systemImage: "plus.circle")
+                            .font(.subheadline)
+                    }
+                } header: {
+                    HStack {
+                        Text("\(recipe.recipeEmoji) \(recipe.recipeName)")
+                        Spacer()
+                        Text("基準\(recipe.baseServings)人前")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
                 }
             }
@@ -79,7 +100,7 @@ struct WeeklyShoppingView: View {
             Section {
                 EmptyView()
             } footer: {
-                Text("同じ品名がすでに未購入リストにある材料は追加されません(数量の合算はしません)。数量は献立の人数に合わせて調整しています。")
+                Text("同じ品名がすでに未購入リストにある材料は追加されません(数量の合算はしません)。買い物リストへは献立の人数に合わせて数量を調整して追加します。")
             }
         }
     }
@@ -87,10 +108,10 @@ struct WeeklyShoppingView: View {
     /// 下部固定の一括追加ボタン。追加対象(チェック済み)が1件でもあるときだけ有効にする
     @ViewBuilder
     private var addBar: some View {
-        if itemCount > 0 {
+        if !recipes.isEmpty {
             Button {
                 Task {
-                    await addSelected()
+                    await apply()
                     dismiss()
                 }
             } label: {
@@ -105,84 +126,93 @@ struct WeeklyShoppingView: View {
         }
     }
 
-    /// 集約結果(ViewModel)を、編集可能なローカルモデルへ変換する
-    private func makeEditableSections() -> [EditableSection] {
-        viewModel.weeklyShoppingSections().map { section in
-            EditableSection(
-                id: section.id,
-                title: section.title,
-                items: section.items.map { item in
-                    // 出所の絵文字は先頭の料理から引く(買い物リストの由来表示に使う)
-                    let emoji = viewModel.recipes.first { $0.name == item.recipeNames.first }?.emoji ?? "🍽️"
-                    return EditableItem(
-                        name: item.name,
-                        quantity: item.quantities.joined(separator: "・"),
-                        recipeNames: item.recipeNames,
-                        recipeEmoji: emoji
+    /// ViewModel のレシピグループを、編集可能なローカルモデルへ変換する
+    private func makeEditableRecipes() -> [EditableRecipe] {
+        viewModel.weeklyRecipeGroups().map { group in
+            EditableRecipe(
+                recipeId: group.recipeId,
+                recipeName: group.recipeName,
+                recipeEmoji: group.recipeEmoji,
+                baseServings: group.baseServings,
+                ingredients: group.ingredients.map { ingredient in
+                    EditableIngredient(
+                        id: ingredient.id,
+                        name: ingredient.name,
+                        quantity: ingredient.quantity ?? ""
                     )
                 }
             )
         }
     }
 
-    /// チェック済みの材料だけを、編集後の数量で買い物リストへ追加する
-    private func addSelected() async {
-        let selected = sections.flatMap(\.items).filter(\.isSelected)
-        let edited = selected.map { item -> MealPlannerViewModel.EditedIngredient in
-            let quantity = item.quantity.trimmingCharacters(in: .whitespaces)
-            return MealPlannerViewModel.EditedIngredient(
-                name: item.name,
-                quantity: quantity.isEmpty ? nil : quantity,
-                recipeName: item.recipeNames.first ?? "",
-                recipeEmoji: item.recipeEmoji
+    /// 編集内容をレシピ帳へ反映しつつ、チェック済みの材料を買い物リストへ追加する
+    private func apply() async {
+        let edits = recipes.map { recipe -> MealPlannerViewModel.WeeklyRecipeEdit in
+            let ingredients = recipe.ingredients.map { item -> RecipeIngredient in
+                let quantity = item.quantity.trimmingCharacters(in: .whitespaces)
+                return RecipeIngredient(
+                    id: item.id,
+                    name: item.name,
+                    quantity: quantity.isEmpty ? nil : quantity
+                )
+            }
+            let selected = Set(recipe.ingredients.filter(\.isSelected).map(\.id))
+            return MealPlannerViewModel.WeeklyRecipeEdit(
+                recipeId: recipe.recipeId,
+                ingredients: ingredients,
+                selectedIngredientIds: selected
             )
         }
-        await viewModel.addSelectedWeeklyIngredients(edited)
+        await viewModel.applyWeeklyEditsAndAdd(edits)
     }
 }
 
 // MARK: - 編集可能なローカルモデル
 
-/// 確認画面で編集できる材料のセクション(売り場カテゴリごと)
-private struct EditableSection: Identifiable {
-    let id: String
-    let title: String
-    var items: [EditableItem]
+/// まとめ買い画面で編集できるレシピ1件(基準人数の分量で持つ)
+private struct EditableRecipe: Identifiable {
+    let recipeId: String
+    let recipeName: String
+    let recipeEmoji: String
+    let baseServings: Int
+    var ingredients: [EditableIngredient]
+    var id: String { recipeId }
 }
 
-/// 確認画面で編集できる材料1件。チェックの有無と数量を変更できる
-private struct EditableItem: Identifiable {
-    let name: String
-    var quantity: String
-    let recipeNames: [String]
-    let recipeEmoji: String
+/// まとめ買い画面で編集できる材料1件。チェックの有無・品名・数量を変更できる。
+/// id は RecipeIngredient.id を引き継ぐ(新規追加行は新しい UUID を採番)。
+private struct EditableIngredient: Identifiable {
+    var id: String = UUID().uuidString
+    var name: String = ""
+    var quantity: String = ""
     var isSelected: Bool = true
-    var id: String { name }
+    var trimmedName: String { name.trimmingCharacters(in: .whitespaces) }
 }
 
 // MARK: - 材料の行
 
-/// 集約した材料1件。チェック・品名・由来の料理名・編集可能な数量を表示する
-private struct EditableShoppingRow: View {
-    @Binding var item: EditableItem
+/// 材料1件の編集行。チェック・品名(編集可)・売り場ラベル・数量(編集可)を表示する
+private struct EditableIngredientRow: View {
+    @Binding var ingredient: EditableIngredient
+    let categoryLabel: String?
 
     var body: some View {
         HStack(spacing: 12) {
             Button {
-                item.isSelected.toggle()
+                ingredient.isSelected.toggle()
             } label: {
-                Image(systemName: item.isSelected ? "checkmark.circle.fill" : "circle")
-                    .foregroundStyle(item.isSelected ? Color.accentColor : .secondary)
+                Image(systemName: ingredient.isSelected ? "checkmark.circle.fill" : "circle")
+                    .foregroundStyle(ingredient.isSelected ? Color.accentColor : .secondary)
                     .font(.title3)
             }
             .buttonStyle(.borderless)
-            .accessibilityLabel(item.isSelected ? "\(item.name)を追加しない" : "\(item.name)を追加する")
+            .accessibilityLabel(ingredient.isSelected ? "追加しない" : "追加する")
 
             VStack(alignment: .leading, spacing: 2) {
-                Text(item.name)
-                    .foregroundStyle(item.isSelected ? .primary : .secondary)
-                if !item.recipeNames.isEmpty {
-                    Text(item.recipeNames.joined(separator: "・"))
+                TextField("材料名", text: $ingredient.name)
+                    .foregroundStyle(ingredient.isSelected ? .primary : .secondary)
+                if let categoryLabel {
+                    Text(categoryLabel)
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
@@ -190,12 +220,11 @@ private struct EditableShoppingRow: View {
 
             Spacer()
 
-            TextField("数量", text: $item.quantity)
+            TextField("数量", text: $ingredient.quantity)
                 .multilineTextAlignment(.trailing)
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
-                .frame(maxWidth: 110)
-                .disabled(!item.isSelected)
+                .frame(maxWidth: 100)
         }
     }
 }
