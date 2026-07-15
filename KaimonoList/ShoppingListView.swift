@@ -21,6 +21,7 @@ struct ShoppingListView: View {
         NavigationStack {
             listContent
                 .navigationTitle("買い物リスト")
+                .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
                     ToolbarItem(placement: .topBarLeading) {
                         NavigationLink {
@@ -79,8 +80,13 @@ struct ShoppingListView: View {
                 } message: {
                     Text("未購入のアイテムをすべて削除します。購入済みは残ります。")
                 }
-                // 品名でリストを絞り込む(アイテムが増えても探しやすくする)
-                .searchable(text: $searchText, prompt: "品名で検索")
+                // 品名でリストを絞り込む(アイテムが増えても探しやすくする)。
+                // navigationBarDrawer(.always) でスクロールしても隠れず常に固定表示する。
+                .searchable(
+                    text: $searchText,
+                    placement: .navigationBarDrawer(displayMode: .always),
+                    prompt: "品名で検索"
+                )
                 // 購入(チェックON)時に成功の触覚を鳴らす
                 .sensoryFeedback(.success, trigger: checkFeedbackTrigger)
                 // 一括削除の直後に表示する「元に戻す」トースト

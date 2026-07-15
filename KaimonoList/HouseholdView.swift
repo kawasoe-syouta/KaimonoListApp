@@ -40,6 +40,7 @@ struct HouseholdView: View {
                 deleteAccountSection
             }
             .navigationTitle("共有")
+            .navigationBarTitleDisplayMode(.inline)
             .onAppear { viewModel.startListening() }
             .sheet(isPresented: $isShowingRenameSheet) {
                 SingleFieldSheet(
