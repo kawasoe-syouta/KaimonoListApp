@@ -17,6 +17,8 @@ struct MealPlanView: View {
     @State private var isConfirmingClearAll = false
     /// 週間まとめ買いシートの表示状態
     @State private var isShowingWeeklyShopping = false
+    /// 上部の日付ストリップで選択中の日(ハイライト表示に使用)。"yyyy-MM-dd" キー
+    @State private var selectedDateKey: String?
 
     /// sheet(item:) に渡すためのラッパー(Date は Identifiable ではないので)。
     /// `allowsDateSelection` が true のときはシート内で日付を選び直せる(「日付を選んで追加」用)。
@@ -36,28 +38,40 @@ struct MealPlanView: View {
 
     var body: some View {
         NavigationStack {
-            List {
-                if viewModel.pendingEntryCount > 0 {
-                    Section {
-                        Button {
-                            isShowingWeeklyShopping = true
-                        } label: {
-                            Label("まとめてリストに追加", systemImage: "cart.badge.plus")
+            ScrollViewReader { proxy in
+                // ストリップは List のオーバーレイではなく上に並ぶヘッダーにする。
+                // こうすると scrollTo での移動先セクションがストリップの下に潜らず、
+                // 一番大きい献立名がカレンダーに隠れて重なることがなくなる。
+                VStack(spacing: 0) {
+                    // 上部に日付ストリップを固定し、タップでその日のセクションへジャンプする。
+                    // 目的の日まで長くスクロールせずに移動・俯瞰できるようにする。
+                    dateStrip(proxy: proxy)
+
+                    List {
+                        if viewModel.pendingEntryCount > 0 {
+                            Section {
+                                Button {
+                                    isShowingWeeklyShopping = true
+                                } label: {
+                                    Label("まとめてリストに追加", systemImage: "cart.badge.plus")
+                                }
+                            } footer: {
+                                Text("献立の材料をまとめて見て、選んで買い物リストへ追加できます。")
+                            }
                         }
-                    } footer: {
-                        Text("献立の材料をまとめて見て、選んで買い物リストへ追加できます。")
+
+                        if !viewModel.pastPendingEntries.isEmpty {
+                            pastPendingSection
+                        }
+
+                        ForEach(viewModel.planDates, id: \.self) { date in
+                            daySection(for: date)
+                        }
                     }
-                }
-
-                if !viewModel.pastPendingEntries.isEmpty {
-                    pastPendingSection
-                }
-
-                ForEach(viewModel.planDates, id: \.self) { date in
-                    daySection(for: date)
                 }
             }
             .navigationTitle("献立")
+            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     NavigationLink {
@@ -114,7 +128,13 @@ struct MealPlanView: View {
                 }
             }
             // 注意: onDisappear で stopListening しない(レシピ帳へ push すると同期が止まるため)
-            .onAppear { viewModel.startListening() }
+            .onAppear {
+                viewModel.startListening()
+                // 日付ストリップの初期選択を今日にする
+                if selectedDateKey == nil {
+                    selectedDateKey = MealPlannerViewModel.dateKey(Calendar.current.startOfDay(for: Date()))
+                }
+            }
             .alert("エラー", isPresented: errorBinding) {
                 Button("OK") { viewModel.errorMessage = nil }
             } message: {
@@ -201,11 +221,81 @@ struct MealPlanView: View {
         )
     }
 
+    // MARK: - 日付ストリップ(横スクロールで日付を選んでジャンプ)
+
+    /// リスト上部に固定する横スクロールの日付ストリップ。
+    /// タップでその日のセクションへスクロールし、献立のある日にはドット印を付ける。
+    private func dateStrip(proxy: ScrollViewProxy) -> some View {
+        ScrollViewReader { stripProxy in
+            VStack(spacing: 0) {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(viewModel.planDates, id: \.self) { date in
+                            let key = MealPlannerViewModel.dateKey(date)
+                            Button {
+                                selectedDateKey = key
+                                // セクション側はチップと id が衝突しないようプレフィックス付き
+                                withAnimation { proxy.scrollTo(Self.sectionId(forKey: key), anchor: .top) }
+                            } label: {
+                                DateChip(date: date,
+                                         hasEntries: !viewModel.entries(on: date).isEmpty,
+                                         isSelected: selectedDateKey == key)
+                            }
+                            .buttonStyle(.plain)
+                            .id(key)
+                        }
+                    }
+                    .padding(.horizontal)
+                    .padding(.vertical, 8)
+                }
+                // ヘッダー・リストとの境目をはっきりさせる区切り線
+                Divider()
+            }
+            // 選択中の日をストリップ内でも見える位置へ寄せる
+            .onChange(of: selectedDateKey) { _, newValue in
+                guard let newValue else { return }
+                withAnimation { stripProxy.scrollTo(newValue, anchor: .center) }
+            }
+        }
+        // 不透明な背景にして、スクロールで下を通る献立の文字が透けて重ならないようにする
+        .background(Color(.systemGroupedBackground))
+    }
+
     // MARK: - 日ごとのセクション
 
     @ViewBuilder
     private func daySection(for date: Date) -> some View {
         let dayEntries = viewModel.entries(on: date)
+        // 日付見出しを「別セクションの1行」にする。
+        // scrollTo の着地先はセクションの中身になるため、見出しを(同じセクションの)ヘッダーに
+        // 置くと上へ押し出されて隠れてしまう。見出しを独立したセクションの行にして id を付けると、
+        // ジャンプ時に日付見出しが画面上部に見える位置で必ず止まる。
+        // 背景を透明にしてグループ背景を見せ、従来のヘッダー(グレー地のラベル)の見た目を保つ。
+        // 献立フォームを別セクションに分けることで、白いカードの角丸がきれいに出る。
+        Section {
+            HStack {
+                Text(Self.dayTitle(for: date))
+                    .font(.subheadline)
+                    .fontWeight(.semibold)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button {
+                    pickTarget = PickTarget(date: date)
+                } label: {
+                    Image(systemName: "plus.circle")
+                }
+                .accessibilityLabel("\(Self.dayTitle(for: date))に献立を追加")
+            }
+            .listRowBackground(Color.clear)
+            .listRowSeparator(.hidden)
+            .listRowInsets(EdgeInsets(top: 2, leading: 20, bottom: 4, trailing: 20))
+            // 上部の日付ストリップからのジャンプ先(scrollTo の対象)。
+            // ストリップのチップと id が衝突しないようプレフィックスを付ける。
+            .id(Self.sectionId(forKey: MealPlannerViewModel.dateKey(date)))
+        }
+        // 見出しと直下の献立カードを近づける(セクション間の既定の広い余白を詰める)
+        .listSectionSpacing(0)
+
         Section {
             if dayEntries.isEmpty {
                 Text("予定なし")
@@ -215,19 +305,11 @@ struct MealPlanView: View {
             ForEach(dayEntries) { entry in
                 planRow(for: entry)
             }
-        } header: {
-            HStack {
-                Text(Self.dayTitle(for: date))
-                Spacer()
-                Button {
-                    pickTarget = PickTarget(date: date)
-                } label: {
-                    Image(systemName: "plus.circle")
-                }
-                .accessibilityLabel("\(Self.dayTitle(for: date))に献立を追加")
-            }
         }
     }
+
+    /// 日付セクションの scrollTo 用 id。ストリップのチップ(日付キーそのまま)と区別する
+    private static func sectionId(forKey key: String) -> String { "section-\(key)" }
 
     /// 日付が過ぎたのに材料を追加していない献立をまとめて表示するセクション。
     /// 各行には過ぎた日付を添えて、いつの予定だったか分かるようにする。
@@ -357,6 +439,63 @@ private struct PlanRow: View {
         .accessibilityAddTraits(.isButton)
         .accessibilityHint("材料を確認")
     }
+}
+
+// MARK: - 日付チップ
+
+/// 日付ストリップの1日分(カレンダー風)。曜日を上に、日付の数字を丸で表示し、
+/// 献立がある日は下にドットを付ける。選択中は数字を塗り丸、今日は淡い丸で示す。
+private struct DateChip: View {
+    let date: Date
+    /// その日に献立があるか(ドット表示の有無)
+    let hasEntries: Bool
+    /// ストリップ内で選択中か(数字を塗り丸で強調)
+    let isSelected: Bool
+
+    private var isToday: Bool { Calendar.current.isDateInToday(date) }
+
+    var body: some View {
+        VStack(spacing: 4) {
+            Text(Self.weekdayFormatter.string(from: date))
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Text(Self.dayFormatter.string(from: date))
+                .font(.system(size: 17, weight: isSelected ? .bold : .regular))
+                .foregroundStyle(numberForeground)
+                .frame(width: 32, height: 32)
+                .background {
+                    if isSelected {
+                        Circle().fill(Color.accentColor)
+                    } else if isToday {
+                        Circle().fill(Color.accentColor.opacity(0.15))
+                    }
+                }
+            Circle()
+                .frame(width: 5, height: 5)
+                .foregroundStyle(Color.accentColor)
+                .opacity(hasEntries ? 1 : 0)
+        }
+        .frame(width: 42)
+    }
+
+    private var numberForeground: Color {
+        if isSelected { return .white }
+        return isToday ? .accentColor : .primary
+    }
+
+    private static let weekdayFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "ja_JP")
+        formatter.dateFormat = "E"
+        return formatter
+    }()
+
+    private static let dayFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "ja_JP")
+        formatter.dateFormat = "d"
+        return formatter
+    }()
 }
 
 // MARK: - おすすめの行
