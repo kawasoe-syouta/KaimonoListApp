@@ -16,6 +16,8 @@ final class MealHistoryViewModel {
     private(set) var entries: [MealPlanEntry] = []
     /// 材料確認用のレシピ表(recipeId → Recipe)。初回に一度だけ取得する
     private(set) var recipesById: [String: Recipe] = [:]
+    /// レシピ帳のレシピ(createdAt 順)。記録追加シートのレシピ選択に使う
+    private(set) var recipes: [Recipe] = []
     /// 初回(または再読み込み)の読み込み中
     private(set) var isLoading = false
     /// 「もっと見る」での追加読み込み中
@@ -25,6 +27,8 @@ final class MealHistoryViewModel {
     /// 初回読み込みを済ませたか(.task の多重実行を防ぐ)
     private(set) var hasLoadedOnce = false
     var errorMessage: String?
+    /// 「○/○に記録しました」などの操作フィードバック
+    var infoMessage: String?
 
     /// 1回の取得件数。「もっと見る」でこの件数ずつ古い記録を足す
     static let pageSize = 40
@@ -32,6 +36,8 @@ final class MealHistoryViewModel {
     // MARK: - 依存
 
     let householdId: String
+    let currentUid: String
+    let currentUserName: String
     private let db = Firestore.firestore()
     /// 次ページ取得の起点にする、直近ページの最後のドキュメント(カーソル)
     private var lastDocument: DocumentSnapshot?
@@ -42,8 +48,10 @@ final class MealHistoryViewModel {
     private var recipesRef: CollectionReference { householdRef.collection("recipes") }
     private var plansRef: CollectionReference { householdRef.collection("mealPlans") }
 
-    init(householdId: String) {
+    init(householdId: String, currentUid: String, currentUserName: String) {
         self.householdId = householdId
+        self.currentUid = currentUid
+        self.currentUserName = currentUserName
     }
 
     // MARK: - 読み込み
@@ -66,9 +74,10 @@ final class MealHistoryViewModel {
     private func loadRecipes() async {
         do {
             let snapshot = try await recipesRef.order(by: "createdAt").getDocuments()
-            let recipes = snapshot.documents.compactMap { try? $0.data(as: Recipe.self) }
+            let loaded = snapshot.documents.compactMap { try? $0.data(as: Recipe.self) }
+            recipes = loaded
             recipesById = Dictionary(
-                recipes.compactMap { recipe in recipe.id.map { ($0, recipe) } },
+                loaded.compactMap { recipe in recipe.id.map { ($0, recipe) } },
                 uniquingKeysWith: { first, _ in first }
             )
         } catch {
@@ -127,6 +136,83 @@ final class MealHistoryViewModel {
     func recipe(for entry: MealPlanEntry) -> Recipe? {
         recipesById[entry.recipeId]
     }
+
+    // MARK: - 事後記録(食べたものをあとから記録する)
+
+    /// レシピ帳にまだ無い「定番レシピ」。記録追加シートの「いろいろな料理」欄に使う。
+    /// すでに同名レシピを登録済みのものは重複を避けて除外する。
+    var catalogCandidates: [Recipe] {
+        let registered = Set(recipes.map { MealSuggester.normalize($0.name) })
+        return RecipeCatalog.all.filter { !registered.contains(MealSuggester.normalize($0.name)) }
+    }
+
+    /// 選んだレシピを指定日の献立(記録)として保存する。
+    /// カタログ由来(まだ Firestore に無い)なら先にレシピ帳へ保存してから記録する。
+    /// 保存後は一覧を取り直し、記録した日を操作フィードバックとして知らせる。
+    func addRecord(recipe: Recipe, on date: Date, servings: Int) async {
+        let clamped = MealPlannerViewModel.clampedServings(servings)
+        do {
+            // 記録に使う recipeId を決める(カタログはレシピ帳へマテリアライズ)
+            let recipeId = try await resolvedRecipeId(for: recipe)
+            let entry = MealPlanEntry(
+                id: nil,
+                date: MealPlannerViewModel.dateKey(date),
+                recipeId: recipeId,
+                recipeName: recipe.name,
+                recipeEmoji: recipe.emoji,
+                addedByUid: currentUid,
+                servings: clamped,
+                createdAt: nil,          // サーバー時刻
+                ingredientsAddedAt: nil
+            )
+            _ = try plansRef.addDocument(from: entry)
+            // 追加した記録が一覧に出るよう先頭から取り直す
+            await reload()
+            // 今日の分は「記録(過去)」ではなく献立タブの今日に入るので、その旨を伝える
+            infoMessage = Calendar.current.isDateInToday(date)
+                ? "今日の献立に追加しました(「献立」タブに表示されます)"
+                : "\(Self.recordedDateLabel(for: date))に記録しました"
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    /// 記録に使うレシピの Firestore ドキュメントIDを返す。
+    /// レシピ帳のレシピはそのID、カタログ由来は同名があれば再利用し、無ければ保存して採番する。
+    private func resolvedRecipeId(for recipe: Recipe) async throws -> String {
+        guard RecipeCatalog.isCatalog(recipe) else {
+            if let id = recipe.id { return id }
+            throw NSError(domain: "MealHistory", code: -1,
+                          userInfo: [NSLocalizedDescriptionKey: "レシピを特定できませんでした"])
+        }
+        let key = MealSuggester.normalize(recipe.name)
+        if let existing = recipes.first(where: { MealSuggester.normalize($0.name) == key }),
+           let id = existing.id {
+            return id
+        }
+        // id / createdAt はサーバー採番に任せるため、合成値を外した新規レシピを保存する
+        let newRecipe = Recipe(
+            id: nil,
+            name: recipe.name,
+            emoji: recipe.emoji,
+            ingredients: recipe.ingredients,
+            memo: recipe.memo,
+            createdAt: nil
+        )
+        let ref = try recipesRef.addDocument(from: newRecipe)
+        return ref.documentID
+    }
+
+    /// 記録完了メッセージ用の日付ラベル("今日" / "昨日" / "M/d(E)")
+    private static func recordedDateLabel(for date: Date) -> String {
+        let calendar = Calendar.current
+        if calendar.isDateInToday(date) { return "今日" }
+        if calendar.isDateInYesterday(date) { return "昨日" }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "ja_JP")
+        formatter.dateFormat = "M/d(E)"
+        return formatter.string(from: date)
+    }
 }
 
 // MARK: - 食べた記録の画面
@@ -137,9 +223,15 @@ struct MealHistoryView: View {
     @State private var viewModel: MealHistoryViewModel
     /// 材料確認シートの対象。nil = 非表示
     @State private var detailTarget: MealPlanEntry?
+    /// 記録追加シートの表示状態
+    @State private var isAddingRecord = false
 
-    init(householdId: String) {
-        _viewModel = State(initialValue: MealHistoryViewModel(householdId: householdId))
+    init(householdId: String, currentUid: String, currentUserName: String) {
+        _viewModel = State(initialValue: MealHistoryViewModel(
+            householdId: householdId,
+            currentUid: currentUid,
+            currentUserName: currentUserName
+        ))
     }
 
     var body: some View {
@@ -149,11 +241,13 @@ struct MealHistoryView: View {
                     if viewModel.isLoading {
                         ProgressView()
                     } else {
-                        ContentUnavailableView(
-                            "まだ記録がありません",
-                            systemImage: "clock.arrow.circlepath",
-                            description: Text("献立に入れた料理は、日付が過ぎるとここで振り返れます。")
-                        )
+                        ContentUnavailableView {
+                            Label("まだ記録がありません", systemImage: "clock.arrow.circlepath")
+                        } description: {
+                            Text("献立に入れた料理は、日付が過ぎるとここで振り返れます。食べたものをあとから記録することもできます。")
+                        } actions: {
+                            Button("記録する") { isAddingRecord = true }
+                        }
                     }
                 } else {
                     historyList
@@ -161,8 +255,22 @@ struct MealHistoryView: View {
             }
             .navigationTitle("食べた記録")
             .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .primaryAction) {
+                    Button {
+                        isAddingRecord = true
+                    } label: {
+                        Label("記録する", systemImage: "plus")
+                    }
+                    .accessibilityLabel("食べたものを記録する")
+                }
+            }
             .task { await viewModel.loadInitial() }
             .refreshable { await viewModel.reload() }
+            .sheet(isPresented: $isAddingRecord) {
+                RecordAddSheet(viewModel: viewModel)
+                    .presentationDetents([.large])
+            }
             .sheet(item: $detailTarget) { entry in
                 MealHistoryDetailSheet(viewModel: viewModel, entry: entry)
                     .presentationDetents([.medium, .large])
@@ -172,6 +280,11 @@ struct MealHistoryView: View {
             } message: {
                 Text(viewModel.errorMessage ?? "")
             }
+            .alert("記録", isPresented: infoBinding) {
+                Button("OK") { viewModel.infoMessage = nil }
+            } message: {
+                Text(viewModel.infoMessage ?? "")
+            }
         }
     }
 
@@ -179,6 +292,13 @@ struct MealHistoryView: View {
         Binding(
             get: { viewModel.errorMessage != nil },
             set: { if !$0 { viewModel.errorMessage = nil } }
+        )
+    }
+
+    private var infoBinding: Binding<Bool> {
+        Binding(
+            get: { viewModel.infoMessage != nil },
+            set: { if !$0 { viewModel.infoMessage = nil } }
         )
     }
 
@@ -355,5 +475,165 @@ private struct MealHistoryDetailSheet: View {
         IngredientScaler.scale(ingredient.quantity,
                                from: recipe.baseServingsOrDefault,
                                to: entry.servingsOrDefault)
+    }
+}
+
+// MARK: - 記録追加シート(食べたものをあとから記録する)
+
+/// 食べたものをあとから記録するシート。まず「いつ食べたか」を今日/昨日/一昨日の
+/// クイックチップ(またはそれ以前の日付を DatePicker)で選び、次にレシピを選ぶと
+/// その日の記録として保存する。事後記録は今日・昨日が大半なので最短で選べるようにする。
+private struct RecordAddSheet: View {
+    let viewModel: MealHistoryViewModel
+
+    @Environment(\.dismiss) private var dismiss
+    /// 記録する日(既定は今日)
+    @State private var selectedDate: Date = Calendar.current.startOfDay(for: Date())
+    /// 記録する人数
+    @State private var servings = MealPlanEntry.defaultServings
+    @State private var searchText = ""
+
+    /// レシピ帳のレシピ(検索で絞り込み)
+    private var myRecipes: [Recipe] { filtered(viewModel.recipes) }
+    /// アプリ内蔵の定番レシピ(登録済みの同名は除外・検索で絞り込み)
+    private var catalog: [Recipe] { filtered(viewModel.catalogCandidates) }
+    private var isSearching: Bool {
+        !searchText.trimmingCharacters(in: .whitespaces).isEmpty
+    }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    quickDateChips
+                    DatePicker("それ以前の日", selection: $selectedDate,
+                               in: ...Calendar.current.startOfDay(for: Date()),
+                               displayedComponents: .date)
+                        .environment(\.locale, Locale(identifier: "ja_JP"))
+                } header: {
+                    Text("いつ食べた？")
+                } footer: {
+                    Text("食べた日を選んでからレシピを選ぶと、その日に記録します。")
+                }
+
+                Section {
+                    Stepper(value: $servings, in: MealPlannerViewModel.servingsRange) {
+                        HStack {
+                            Text("人数")
+                            Spacer()
+                            Text("\(servings)人前")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                } footer: {
+                    Text("選んだレシピをこの人数で記録します。")
+                }
+
+                if !myRecipes.isEmpty {
+                    Section("マイレシピ") {
+                        ForEach(myRecipes) { recipe in
+                            recipeButton(recipe, subtitle: "材料 \(recipe.ingredients.count)品")
+                        }
+                    }
+                }
+
+                if !catalog.isEmpty {
+                    Section {
+                        ForEach(catalog) { recipe in
+                            recipeButton(recipe, subtitle: ingredientSummary(recipe))
+                        }
+                    } header: {
+                        Text("いろいろな料理から選ぶ")
+                    } footer: {
+                        Text("選ぶと自動でマイレシピに登録されます。")
+                    }
+                }
+
+                if isSearching && myRecipes.isEmpty && catalog.isEmpty {
+                    ContentUnavailableView.search(text: searchText)
+                }
+            }
+            .searchable(text: $searchText, prompt: "料理名・食材で検索")
+            .navigationTitle("食べたものを記録")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("閉じる") { dismiss() }
+                }
+            }
+        }
+    }
+
+    /// 今日・昨日・一昨日のクイック日付チップ。タップでその日を選ぶ
+    private var quickDateChips: some View {
+        HStack(spacing: 8) {
+            ForEach(Self.quickDates, id: \.label) { item in
+                let isSelected = Calendar.current.isDate(selectedDate, inSameDayAs: item.date)
+                Button {
+                    selectedDate = item.date
+                } label: {
+                    Text(item.label)
+                        .font(.subheadline)
+                        .padding(.vertical, 6)
+                        .padding(.horizontal, 14)
+                        .background(isSelected ? Color.accentColor : Color(.secondarySystemBackground),
+                                    in: Capsule())
+                        .foregroundStyle(isSelected ? Color.white : Color.primary)
+                }
+                .buttonStyle(.plain)
+            }
+            Spacer()
+        }
+        .listRowInsets(EdgeInsets(top: 8, leading: 20, bottom: 8, trailing: 20))
+    }
+
+    /// クイックチップの候補(今日・昨日・一昨日)
+    private static var quickDates: [(label: String, date: Date)] {
+        let calendar = Calendar.current
+        let today = calendar.startOfDay(for: Date())
+        return [
+            ("今日", today),
+            ("昨日", calendar.date(byAdding: .day, value: -1, to: today) ?? today),
+            ("一昨日", calendar.date(byAdding: .day, value: -2, to: today) ?? today),
+        ]
+    }
+
+    /// レシピ1件のボタン行。選ぶと記録して閉じる
+    @ViewBuilder
+    private func recipeButton(_ recipe: Recipe, subtitle: String) -> some View {
+        Button {
+            Task { await viewModel.addRecord(recipe: recipe, on: selectedDate, servings: servings) }
+            dismiss()
+        } label: {
+            HStack(spacing: 12) {
+                Text(recipe.emoji)
+                    .font(.title3)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(recipe.name)
+                        .foregroundStyle(.primary)
+                    if !subtitle.isEmpty {
+                        Text(subtitle)
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+            }
+        }
+    }
+
+    /// 料理名または材料名で絞り込む(検索語が空ならそのまま返す)
+    private func filtered(_ recipes: [Recipe]) -> [Recipe] {
+        let query = searchText.trimmingCharacters(in: .whitespaces)
+        guard !query.isEmpty else { return recipes }
+        return recipes.filter { recipe in
+            recipe.name.localizedCaseInsensitiveContains(query)
+                || recipe.ingredients.contains { $0.name.localizedCaseInsensitiveContains(query) }
+        }
+    }
+
+    /// 定番レシピの補足行(主な材料を先頭3件まで)
+    private func ingredientSummary(_ recipe: Recipe) -> String {
+        let names = recipe.ingredients.prefix(3).map(\.name).joined(separator: "・")
+        return recipe.ingredients.count > 3 ? "\(names) ほか" : names
     }
 }

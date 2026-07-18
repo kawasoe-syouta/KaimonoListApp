@@ -22,31 +22,35 @@ final class MealPlannerViewModel {
     private(set) var suggestions: [MealSuggester.Suggestion] = []
     private(set) var isGeneratingSuggestions = false
 
-    /// 献立表の既定の表示日数(今日を含む)。これより先の日付でも、予定があればその日は表示する
-    static let planWindowDays = 14
     /// 日付を過ぎた献立を「未処理」として拾い続ける猶予日数。
     /// これより古い未処理の献立は監視対象から外す(際限なく溜まらないようにする)
     static let pastGraceDays = 30
 
-    /// 献立表に表示する日付。今日から `planWindowDays` 日分を基本にしつつ、
-    /// その先の日付に予定が入っていればその日も含める(遠い未来の予定が隠れないように)。
+    /// 献立表に表示する日付。今月の1日〜末日を基本にしつつ、
+    /// 今月より先(来月以降)の日付に予定が入っていればその日も含める(遠い未来の予定が隠れないように)。
+    /// 月が変わると自動でその月の範囲になる。
     var planDates: [Date] {
         let calendar = Calendar.current
         let today = calendar.startOfDay(for: Date())
+        guard let monthInterval = calendar.dateInterval(of: .month, for: today) else { return [] }
+        let monthStart = calendar.startOfDay(for: monthInterval.start)
+
         var keys: Set<String> = []
         var dates: [Date] = []
-        // 既定ウィンドウ(今日から planWindowDays 日)
-        for offset in 0..<Self.planWindowDays {
-            guard let date = calendar.date(byAdding: .day, value: offset, to: today) else { continue }
+        // 今月の1日〜末日(monthInterval.end は翌月1日の0時なので、それ未満をループ)
+        var date = monthStart
+        while date < monthInterval.end {
             keys.insert(Self.dateKey(date))
             dates.append(date)
+            guard let next = calendar.date(byAdding: .day, value: 1, to: date) else { break }
+            date = next
         }
-        // ウィンドウより先の日付に予定があれば、その日も表示対象に加える
-        let todayKey = Self.dateKey(today)
-        for entry in planEntries where entry.date >= todayKey && !keys.contains(entry.date) {
-            guard let date = Self.date(fromKey: entry.date) else { continue }
+        // 今月より先(来月以降)の日付に予定があれば、その日も表示対象に加える。
+        // 今月より前の過去日は既定では出さない(「記録」タブで振り返る)。
+        for entry in planEntries where !keys.contains(entry.date) {
+            guard let entryDate = Self.date(fromKey: entry.date), entryDate >= monthStart else { continue }
             keys.insert(entry.date)
-            dates.append(date)
+            dates.append(entryDate)
         }
         return dates.sorted()
     }
@@ -56,11 +60,12 @@ final class MealPlannerViewModel {
         return planEntries.filter { $0.date == key }
     }
 
-    /// 日付を過ぎたのに材料をまだ買い物リストへ追加していない献立(買い忘れ防止に「未処理」として表示)。
+    /// 今月より前なのに材料をまだ買い物リストへ追加していない献立(買い忘れ防止に「未処理」として表示)。
     /// 古い順に並べる。監視範囲(pastGraceDays)より前のものは含まれない。
+    /// 今月内の過去日はカレンダー(planDates)の各日セクションに出るので、ここには含めず重複を避ける。
     var pastPendingEntries: [MealPlanEntry] {
-        let todayKey = Self.dateKey(Calendar.current.startOfDay(for: Date()))
-        return planEntries.filter { $0.date < todayKey && $0.ingredientsAddedAt == nil }
+        let monthStartKey = Self.dateKey(Self.currentMonthDateRange().lowerBound)
+        return planEntries.filter { $0.date < monthStartKey && $0.ingredientsAddedAt == nil }
     }
 
     /// 献立エントリに対応するレシピ。削除済みなら nil(材料確認画面で使用)
@@ -68,19 +73,21 @@ final class MealPlannerViewModel {
         recipes.first { $0.id == entry.recipeId }
     }
 
-    /// 材料をまだ買い物リストへ展開していない献立の数(まとめて追加ボタンの表示判定)
+    /// 材料をまだ買い物リストへ展開していない「今日以降の」献立の数(まとめて追加ボタンの表示判定)。
+    /// 今月内の過去日は記録なので買い物操作の対象にしない。
     var pendingEntryCount: Int {
-        planEntries.filter { $0.ingredientsAddedAt == nil }.count
+        planEntries.filter { $0.date >= Self.todayKey() && $0.ingredientsAddedAt == nil }.count
     }
 
-    /// 表示中(今日以降)の献立が1件でもあるか(まとめて削除ボタンの活性判定)
+    /// 今日以降の献立が1件でもあるか(まとめて削除ボタンの活性判定)。
+    /// 過去日の記録は一括削除の対象にしないので数えない。
     var hasPlanEntries: Bool {
-        !planEntries.isEmpty
+        planEntries.contains { $0.date >= Self.todayKey() }
     }
 
-    /// 材料をすでに買い物リストへ展開した献立があるか(まとめて削除の選択肢切り替えに使用)
+    /// 今日以降で材料をすでに買い物リストへ展開した献立があるか(まとめて削除の選択肢切り替えに使用)
     var hasAddedIngredients: Bool {
-        planEntries.contains { $0.ingredientsAddedAt != nil }
+        planEntries.contains { $0.date >= Self.todayKey() && $0.ingredientsAddedAt != nil }
     }
 
     // MARK: - 週間まとめ買い(レシピ別に編集して追加)
@@ -101,7 +108,8 @@ final class MealPlannerViewModel {
     func weeklyRecipeGroups() -> [WeeklyRecipeGroup] {
         var order: [String] = []
         var seen: Set<String> = []
-        for entry in planEntries where entry.ingredientsAddedAt == nil {
+        // 今日以降の未展開のみ対象(今月内の過去日は記録なので買い物操作の対象にしない)
+        for entry in planEntries where entry.date >= Self.todayKey() && entry.ingredientsAddedAt == nil {
             let id = entry.recipeId
             guard !seen.contains(id), recipes.contains(where: { $0.id == id }) else { continue }
             seen.insert(id)
@@ -179,9 +187,26 @@ final class MealPlannerViewModel {
         dateKeyFormatter.string(from: date)
     }
 
+    /// 今日(端末タイムゾーンの暦日始まり)の日付キー。
+    /// 「今日以降=操作対象」「今日より前=記録」を切り分ける基準に使う。
+    static func todayKey() -> String {
+        dateKey(Calendar.current.startOfDay(for: Date()))
+    }
+
     /// "yyyy-MM-dd" のキーから端末タイムゾーンの暦日を復元する(dateKey の逆変換)
     static func date(fromKey key: String) -> Date? {
         dateKeyFormatter.date(from: key)
+    }
+
+    /// 「日付を選んで献立を追加」で選べる日付の範囲(今月の1日〜末日)。
+    /// 献立を追加できる期間を今月に限定するために使う(表示範囲 planDates と揃える)。
+    static func currentMonthDateRange(now: Date = Date(), calendar: Calendar = .current) -> ClosedRange<Date> {
+        let today = calendar.startOfDay(for: now)
+        guard let interval = calendar.dateInterval(of: .month, for: today) else { return today...today }
+        let start = calendar.startOfDay(for: interval.start)
+        // interval.end は翌月1日の0時。末日の0時を上限にする
+        let lastDay = calendar.date(byAdding: .day, value: -1, to: interval.end) ?? start
+        return start...calendar.startOfDay(for: lastDay)
     }
 
     // MARK: - リアルタイム同期
@@ -204,9 +229,10 @@ final class MealPlannerViewModel {
                 } ?? []
             }
 
-        // 今日以降の献立に加え、直近 pastGraceDays 日分も監視する。
-        // 過去分のうち「材料を追加済み」のものは処理済みなので画面に出さず(ローカルで除外)、
-        // 「未処理」の過去献立だけを買い忘れ防止として残す。それより古い過去分は監視しない。
+        // 今月以降の献立に加え、直近 pastGraceDays 日分も監視する。
+        // 今月内の過去日は処理済みも含めて「記録」として画面に残す。
+        // 今月より前は「未処理」だけを買い忘れ防止として残し、処理済みは除外する。
+        // それより古い過去分は監視しない。
         let today = Calendar.current.startOfDay(for: Date())
         let pastCutoff = Calendar.current.date(byAdding: .day, value: -Self.pastGraceDays, to: today) ?? today
         plansListener = plansRef
@@ -222,9 +248,10 @@ final class MealPlannerViewModel {
                 let decoded = snapshot?.documents.compactMap {
                     try? $0.data(as: MealPlanEntry.self)
                 } ?? []
-                // 過去の処理済み献立は表示対象外(今日以降 or 未処理のみ残す)
-                let todayKey = Self.dateKey(Calendar.current.startOfDay(for: Date()))
-                let visible = decoded.filter { $0.date >= todayKey || $0.ingredientsAddedAt == nil }
+                // 今月以降は処理済みも残し(今月内の過去日を記録として表示)、
+                // 今月より前は未処理のみ残す(買い忘れ防止の「未処理」用)。
+                let monthStartKey = Self.dateKey(Self.currentMonthDateRange().lowerBound)
+                let visible = decoded.filter { $0.date >= monthStartKey || $0.ingredientsAddedAt == nil }
                 // date + createdAt の複合ソートはローカルで行う(複合インデックス不要にするため)
                 self.planEntries = visible.sorted {
                     ($0.date, $0.createdAt ?? .distantPast) < ($1.date, $1.createdAt ?? .distantPast)
@@ -514,11 +541,12 @@ final class MealPlannerViewModel {
         }
     }
 
-    /// 表示中(今日以降)の献立をすべて削除する。買い物リストの「まとめて削除」に相当。
+    /// 今日以降の献立をすべて削除する。買い物リストの「まとめて削除」に相当。
+    /// 今月内の過去日の献立は「記録」なので削除対象にしない(記録を残す)。
     /// - Parameter alsoRemovingIngredients: true のとき、削除する献立の材料のうち
     ///   「未購入」のものを買い物リストからも削除する。購入済み(チェック済み)は残す。
     func removeAllPlans(alsoRemovingIngredients: Bool) async {
-        let entries = planEntries
+        let entries = planEntries.filter { $0.date >= Self.todayKey() }
         guard !entries.isEmpty else { return }
 
         // 全献立を消すので「残る献立で使う材料」は無い → 各レシピの全材料が削除候補になる。
@@ -663,9 +691,11 @@ final class MealPlannerViewModel {
     func applyWeeklyEditsAndAdd(_ edits: [WeeklyRecipeEdit]) async {
         guard !edits.isEmpty else { return }
 
-        // レシピが解決できる未展開の献立(まとめ買いの対象)
+        // レシピが解決できる、今日以降の未展開の献立(まとめ買いの対象)。
+        // 今月内の過去日は記録なので対象外。
         let pending = planEntries.filter { entry in
-            entry.ingredientsAddedAt == nil && recipes.contains { $0.id == entry.recipeId }
+            entry.date >= Self.todayKey() && entry.ingredientsAddedAt == nil
+                && recipes.contains { $0.id == entry.recipeId }
         }
         guard !pending.isEmpty else { return }
 
@@ -728,9 +758,10 @@ final class MealPlannerViewModel {
         }
     }
 
-    /// 未展開の献立すべての材料をまとめて買い物リストへ追加する
+    /// 今日以降の未展開の献立すべての材料をまとめて買い物リストへ追加する
+    /// (今月内の過去日は記録なので対象外)
     func addAllPendingIngredients() async {
-        let pending = planEntries.filter { $0.ingredientsAddedAt == nil }
+        let pending = planEntries.filter { $0.date >= Self.todayKey() && $0.ingredientsAddedAt == nil }
         guard !pending.isEmpty else { return }
 
         var ingredients: [IngredientToAdd] = []
@@ -829,10 +860,12 @@ final class MealPlannerViewModel {
     /// すべて無くなったものは「追加済み」を解除し、再び追加できる状態へ戻す。
     /// 材料が1つでもリストに残っていれば追加済みのままにする。
     /// (レシピが削除済み・材料が空の献立は判定できないので対象外)
+    /// 今月内の過去日は「記録」なので、材料が消えても追加済みは解除しない(今日以降のみ対象)。
     private func resetAddedStatusForRemovedIngredients() {
+        let todayKey = Self.todayKey()
         let batch = db.batch()
         var writes = 0
-        for entry in planEntries where entry.ingredientsAddedAt != nil {
+        for entry in planEntries where entry.date >= todayKey && entry.ingredientsAddedAt != nil {
             guard let id = entry.id,
                   let recipe = recipes.first(where: { $0.id == entry.recipeId }) else { continue }
             let names = recipe.ingredients.map(\.name).filter { !$0.isEmpty }

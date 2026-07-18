@@ -19,6 +19,9 @@ struct MealPlanView: View {
     @State private var isShowingWeeklyShopping = false
     /// 上部の日付ストリップで選択中の日(ハイライト表示に使用)。"yyyy-MM-dd" キー
     @State private var selectedDateKey: String?
+    /// 初回表示で今日の位置までスクロール済みか。
+    /// 月初(1日)から表示するため、今日が中旬でも開いた直後に今日が見えるようにする
+    @State private var didScrollToToday = false
 
     /// sheet(item:) に渡すためのラッパー(Date は Identifiable ではないので)。
     /// `allowsDateSelection` が true のときはシート内で日付を選び直せる(「日付を選んで追加」用)。
@@ -65,6 +68,17 @@ struct MealPlanView: View {
                 // 中身がバーの裏を流れるとシステム標準の透ける効果が出て、リスト・共有タブの
                 // ヘッダーと同じ見た目になる。iOS 26 未満は safeAreaInset+マテリアルにフォールバック。
                 .modifier(CalendarBar { dateStrip(proxy: proxy) })
+                // 初回表示で今日のセクションへスクロールする(月初からの過去日で今日が隠れないように)
+                .onAppear {
+                    guard !didScrollToToday else { return }
+                    didScrollToToday = true
+                    let todayId = Self.sectionId(
+                        forKey: MealPlannerViewModel.dateKey(Calendar.current.startOfDay(for: Date()))
+                    )
+                    DispatchQueue.main.async {
+                        proxy.scrollTo(todayId, anchor: .top)
+                    }
+                }
             }
             .navigationTitle("献立")
             .navigationBarTitleDisplayMode(.inline)
@@ -187,9 +201,9 @@ struct MealPlanView: View {
                 Button("キャンセル", role: .cancel) {}
             } message: {
                 if viewModel.hasAddedIngredients {
-                    Text("表示中の献立をすべて削除します。追加済みの材料も買い物リストから削除しますか？(未購入のみ・購入済みは残します)")
+                    Text("今日以降の献立をすべて削除します(過去日の記録は残します)。追加済みの材料も買い物リストから削除しますか？(未購入のみ・購入済みは残します)")
                 } else {
-                    Text("表示中の献立をすべて削除します。")
+                    Text("今日以降の献立をすべて削除します(過去日の記録は残します)。")
                 }
             }
         }
@@ -305,9 +319,15 @@ struct MealPlanView: View {
                     .foregroundStyle(.tertiary)
             }
             ForEach(dayEntries) { entry in
-                planRow(for: entry)
+                // 今日より前の日(=今月の過去日)の献立は「記録」として読み取り専用で表示する
+                planRow(for: entry, isRecord: Self.isPastDay(date))
             }
         }
+    }
+
+    /// その日付が今日より前(=今月の過去日)か。過去日の献立は「記録」扱いにする
+    private static func isPastDay(_ date: Date) -> Bool {
+        Calendar.current.startOfDay(for: date) < Calendar.current.startOfDay(for: Date())
     }
 
     /// 日付セクションの scrollTo 用 id。ストリップのチップ(日付キーそのまま)と区別する
@@ -330,9 +350,11 @@ struct MealPlanView: View {
 
     /// 献立1件の行(日ごとのセクション・未処理セクション共用)。
     /// `dateLabel` を渡すと過ぎた日付を行に表示する。
+    /// `isRecord` が true のとき「記録」として読み取り専用表示にする(今月の過去日)。
     @ViewBuilder
-    private func planRow(for entry: MealPlanEntry, dateLabel: String? = nil) -> some View {
-        PlanRow(entry: entry, dateLabel: dateLabel) {
+    private func planRow(for entry: MealPlanEntry, dateLabel: String? = nil,
+                         isRecord: Bool = false) -> some View {
+        PlanRow(entry: entry, dateLabel: dateLabel, isRecord: isRecord) {
             Task { await viewModel.addIngredients(for: entry) }
         } onEditServings: {
             editServingsTarget = entry
@@ -345,9 +367,10 @@ struct MealPlanView: View {
             } label: {
                 Label("削除", systemImage: "trash")
             }
-            // 材料を買い物リストへ追加済みの献立は、編集してもリストへ反映されないため
-            // 混乱を避けて編集を出さない(材料の確認はタップで引き続き可能)
-            if entry.ingredientsAddedAt == nil {
+            // 記録(過去日)、および材料を追加済みの献立は編集を出さない。
+            // 追加済みは編集してもリストへ反映されず、記録は振り返り用途のため混乱を避ける
+            // (材料の確認はタップで引き続き可能)
+            if !isRecord && entry.ingredientsAddedAt == nil {
                 Button {
                     editRecipeTarget = entry
                 } label: {
@@ -385,6 +408,9 @@ private struct PlanRow: View {
     let entry: MealPlanEntry
     /// 過ぎた日付のラベル(未処理セクションで表示)。nil のときは表示しない
     var dateLabel: String? = nil
+    /// 「記録」(今月の過去日)として読み取り専用表示にするか。
+    /// true のとき人数編集・カート追加は出さず、「記録済み」バッジを表示する。
+    var isRecord: Bool = false
     let onAddIngredients: () -> Void
     let onEditServings: () -> Void
     let onShowDetail: () -> Void
@@ -407,22 +433,30 @@ private struct PlanRow: View {
                         .foregroundStyle(.tertiary)
                 }
                 Text(entry.recipeName)
-                // 追加済み(材料展開済み)の献立は人数も編集不可にして静的表示にする。
+                // 記録(過去日)は人数を静的表示にする。
+                // 追加済み(材料展開済み)も編集不可にして静的表示にする。
                 // 未追加のときだけタップで人数編集シートを開く
-                if entry.ingredientsAddedAt == nil {
+                if isRecord || entry.ingredientsAddedAt != nil {
+                    servingsLabel
+                } else {
                     Button(action: onEditServings) {
                         servingsLabel
                     }
                     .buttonStyle(.borderless)   // 行全体へのタップ拡散を防ぐ
                     .accessibilityLabel("\(entry.recipeName)の人数を変更(現在\(entry.servingsOrDefault)人前)")
-                } else {
-                    servingsLabel
                 }
             }
 
             Spacer()
 
-            if entry.ingredientsAddedAt != nil {
+            if isRecord {
+                // 今月の過去日は「記録」タブに残っていることを示すバッジ
+                Label("記録済み", systemImage: "clock.arrow.circlepath")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .labelStyle(.titleAndIcon)
+                    .accessibilityLabel("記録に保存済み")
+            } else if entry.ingredientsAddedAt != nil {
                 Label("追加済み", systemImage: "checkmark.circle.fill")
                     .font(.caption)
                     .foregroundStyle(.green)
@@ -781,11 +815,11 @@ private struct RecipePickerSheet: View {
                 if allowsDateSelection {
                     Section {
                         DatePicker("日付", selection: $selectedDate,
-                                   in: Calendar.current.startOfDay(for: Date())...,
+                                   in: MealPlannerViewModel.currentMonthDateRange(),
                                    displayedComponents: .date)
                             .environment(\.locale, Locale(identifier: "ja_JP"))
                     } footer: {
-                        Text("選んだレシピをこの日付で献立に追加します。")
+                        Text("選んだレシピをこの日付で献立に追加します。追加できるのは今月内の日付です。")
                     }
                 }
 

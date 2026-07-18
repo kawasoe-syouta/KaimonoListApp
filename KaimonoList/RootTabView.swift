@@ -28,8 +28,12 @@ struct RootTabView: View {
                 )
                 .tabItem { Label("献立", systemImage: "fork.knife") }
 
-                MealHistoryView(householdId: householdId)
-                    .tabItem { Label("記録", systemImage: "clock.arrow.circlepath") }
+                MealHistoryView(
+                    householdId: householdId,
+                    currentUid: uid,
+                    currentUserName: session.displayName
+                )
+                .tabItem { Label("記録", systemImage: "clock.arrow.circlepath") }
 
                 HouseholdView(session: session)
                     .tabItem { Label("共有", systemImage: "person.2") }
